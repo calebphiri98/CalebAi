@@ -10,18 +10,66 @@ function App() {
     },
   ]);
 
-  const sendMessage = () => {
-    if (!message.trim()) return;
+  const [loading, setLoading] = useState(false);
 
+  const sendMessage = async () => {
+    const trimmedMessage = message.trim();
+
+    if (!trimmedMessage || loading) return;
+
+    // Show the user's message immediately
     setMessages((previousMessages) => [
       ...previousMessages,
       {
         role: "user",
-        text: message,
+        text: trimmedMessage,
       },
     ]);
 
     setMessage("");
+    setLoading(true);
+
+    try {
+      const response = await fetch(
+        "http://localhost:5000/api/ai/chat",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message: trimmedMessage,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Failed to get AI response");
+      }
+
+      // Add Caleb AI's response
+      setMessages((previousMessages) => [
+        ...previousMessages,
+        {
+          role: "ai",
+          text: data.reply,
+        },
+      ]);
+    } catch (error) {
+      console.error("Chat error:", error);
+
+      setMessages((previousMessages) => [
+        ...previousMessages,
+        {
+          role: "ai",
+          text: "Sorry, I could not connect to Caleb AI right now.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -51,6 +99,14 @@ function App() {
               </div>
             </div>
           ))}
+
+          {loading && (
+            <div className="message-row ai">
+              <div className="message">
+                Caleb AI is thinking...
+              </div>
+            </div>
+          )}
         </main>
 
         <div className="input-area">
@@ -64,10 +120,14 @@ function App() {
                 sendMessage();
               }
             }}
+            disabled={loading}
           />
 
-          <button onClick={sendMessage}>
-            Send
+          <button
+            onClick={sendMessage}
+            disabled={loading}
+          >
+            {loading ? "Thinking..." : "Send"}
           </button>
         </div>
 
