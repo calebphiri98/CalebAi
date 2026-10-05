@@ -1,36 +1,77 @@
 import { useState } from "react";
+import "./App.css";
 
 function App() {
-  const [response, setResponse] = useState("");
+  const [message, setMessage] = useState("");
+  const [messages, setMessages] = useState([
+    {
+      role: "ai",
+      text: "Hello! I am Caleb AI. How can I help you today?",
+    },
+  ]);
 
-  const sendMessage = async () => {
-    try {
-      const res = await fetch("http://localhost:5000/");
+  const sendMessage = () => {
+    if (!message.trim()) return;
 
-      const data = await res.json();
+    setMessages((previousMessages) => [
+      ...previousMessages,
+      {
+        role: "user",
+        text: message,
+      },
+    ]);
 
-      setResponse(data.message);
-    } catch (error) {
-      console.error(error);
-      setResponse("Could not connect to the backend.");
-    }
+    setMessage("");
   };
 
   return (
-    <div>
-      <h1>Caleb AI</h1>
+    <div className="app">
+      <div className="chat-container">
 
-      <p>My AI assistant is being built.</p>
+        <header className="chat-header">
+          <div>
+            <h1>Caleb AI</h1>
+            <p>Your personal AI assistant</p>
+          </div>
 
-      <button onClick={sendMessage}>
-        Test Backend Connection
-      </button>
+          <div className="status">
+            <span className="status-dot"></span>
+            Online
+          </div>
+        </header>
 
-      {response && (
-        <p>
-          Backend says: <strong>{response}</strong>
-        </p>
-      )}
+        <main className="messages">
+          {messages.map((item, index) => (
+            <div
+              key={index}
+              className={`message-row ${item.role}`}
+            >
+              <div className="message">
+                {item.text}
+              </div>
+            </div>
+          ))}
+        </main>
+
+        <div className="input-area">
+          <input
+            type="text"
+            placeholder="Ask Caleb AI anything..."
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                sendMessage();
+              }
+            }}
+          />
+
+          <button onClick={sendMessage}>
+            Send
+          </button>
+        </div>
+
+      </div>
     </div>
   );
 }
