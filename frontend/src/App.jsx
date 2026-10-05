@@ -3,6 +3,7 @@ import "./App.css";
 
 function App() {
   const [message, setMessage] = useState("");
+
   const [messages, setMessages] = useState([
     {
       role: "ai",
@@ -17,13 +18,15 @@ function App() {
 
     if (!trimmedMessage || loading) return;
 
-    // Show the user's message immediately
+    const userMessage = {
+      role: "user",
+      text: trimmedMessage,
+    };
+
+    // Add user's message to the screen
     setMessages((previousMessages) => [
       ...previousMessages,
-      {
-        role: "user",
-        text: trimmedMessage,
-      },
+      userMessage,
     ]);
 
     setMessage("");
@@ -37,8 +40,10 @@ function App() {
           headers: {
             "Content-Type": "application/json",
           },
+
           body: JSON.stringify({
             message: trimmedMessage,
+            history: messages,
           }),
         }
       );
@@ -46,17 +51,22 @@ function App() {
       const data = await response.json();
 
       if (!response.ok || !data.success) {
-        throw new Error(data.message || "Failed to get AI response");
+        throw new Error(
+          data.message || "Failed to get AI response"
+        );
       }
 
-      // Add Caleb AI's response
+      const aiMessage = {
+        role: "ai",
+        text: data.reply,
+      };
+
+      // Add AI response to the conversation
       setMessages((previousMessages) => [
         ...previousMessages,
-        {
-          role: "ai",
-          text: data.reply,
-        },
+        aiMessage,
       ]);
+
     } catch (error) {
       console.error("Chat error:", error);
 
@@ -67,6 +77,7 @@ function App() {
           text: "Sorry, I could not connect to Caleb AI right now.",
         },
       ]);
+
     } finally {
       setLoading(false);
     }
@@ -89,6 +100,7 @@ function App() {
         </header>
 
         <main className="messages">
+
           {messages.map((item, index) => (
             <div
               key={index}
@@ -107,9 +119,11 @@ function App() {
               </div>
             </div>
           )}
+
         </main>
 
         <div className="input-area">
+
           <input
             type="text"
             placeholder="Ask Caleb AI anything..."
@@ -129,6 +143,7 @@ function App() {
           >
             {loading ? "Thinking..." : "Send"}
           </button>
+
         </div>
 
       </div>

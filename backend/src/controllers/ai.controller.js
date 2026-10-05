@@ -2,7 +2,7 @@ const { generateAIResponse } = require("../services/ai.service.js");
 
 const chatWithAI = async (req, res) => {
     try {
-        const { message } = req.body;
+        const { message, history = [] } = req.body;
 
         if (!message) {
             return res.status(400).json({
@@ -11,7 +11,7 @@ const chatWithAI = async (req, res) => {
             });
         }
 
-        const reply = await generateAIResponse(message);
+        const reply = await generateAIResponse(message, history);
 
         res.json({
             success: true,
