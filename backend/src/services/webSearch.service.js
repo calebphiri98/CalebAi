@@ -1,3 +1,5 @@
+const SEARCH_TIMEOUT_MS = 8000;
+
 const searchWeb = async (query) => {
     if (!process.env.TAVILY_API_KEY) {
         throw new Error("TAVILY_API_KEY is missing");
@@ -15,8 +17,10 @@ const searchWeb = async (query) => {
             query,
             search_depth: "basic",
             topic: "general",
-            max_results: 5
-        })
+            max_results: 4
+        }),
+
+        signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
     });
 
     if (!response.ok) {
