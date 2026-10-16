@@ -7,36 +7,23 @@ const ai = new GoogleGenAI({
 
 const MODEL = "gemini-3.5-flash-lite";
 const TIMEZONE = process.env.TIMEZONE || "Africa/Blantyre";
+const MAX_TOOL_ROUNDS = 3;
 
-const SEARCH_KEYWORDS = [
-    "current",
-    "latest",
-    "today",
-    "tonight",
-    "recent",
-    "recently",
-    "news",
-    "now",
-    "this week",
-    "this month",
-    "this year",
-    String(new Date().getFullYear()),
-    "who is the current",
-    "what is the latest",
-    "latest version",
-    "recent update",
-    "happening today",
-    "weather",
-    "search the web",
-    "look up"
-];
-
-const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const SEARCH_PATTERN = new RegExp(
-    `\\b(${SEARCH_KEYWORDS.map(escapeRegExp).join("|")})\\b`,
-    "i"
-);
+const SEARCH_TOOL = {
+    name: "search_web",
+    description:
+        "Search the web for current or recent information. Use it for news, who currently holds a position, prices, weather, sports results, latest versions, and any fact that may have changed over time.",
+    parametersJsonSchema: {
+        type: "object",
+        properties: {
+            query: {
+                type: "string",
+                description: "A short, specific web search query."
+            }
+        },
+        required: ["query"]
+    }
+};
 
 const BASE_SYSTEM_INSTRUCTION = [
     "You are Caleb AI, a personal AI assistant being developed by Caleb.",
@@ -107,24 +94,14 @@ const BASE_SYSTEM_INSTRUCTION = [
     "- Put all code in fenced code blocks with the language name."
 ].join("\n");
 
-const WEB_CONTEXT_INTRO = [
-    "LIVE WEB SEARCH RESULTS",
+const TOOL_GUIDE = [
     "",
-    "The following information was retrieved from the web for the user's question.",
     "",
-    "Use this information as evidence for your answer.",
-    "",
-    "Important:",
-    "- Answer the user's actual question directly.",
-    "- Do not respond with a generic greeting.",
-    "- Do not ignore the search results.",
-    "- Prefer recent and reliable information.",
-    "- If different sources disagree, explain the disagreement.",
-    "- Do not treat old information as current.",
-    "- Do not invent facts that are not supported by the search results."
+    "Tools:",
+    "- You have one tool, search_web. Use it for anything that may have changed over time, such as current office holders, news, prices, weather, sports and latest versions.",
+    "- Do not use it for greetings, general knowledge, explanations, writing or programming help.",
+    "- Never invent or call any tool other than search_web."
 ].join("\n");
-
-const needsWebSearch = (message) => SEARCH_PATTERN.test(message);
 
 const formatDate = () => {
     const stamp = new Date().toLocaleString("en-GB", {
@@ -134,24 +111,6 @@ const formatDate = () => {
     });
 
     return `\n\nCurrent date and time: ${stamp} (${TIMEZONE}).`;
-};
-
-const formatSearchResults = (results) => {
-    if (!results || results.length === 0) {
-        return "No web search results were found.";
-    }
-
-    return results
-        .map((result, index) =>
-            [
-                `SOURCE ${index + 1}`,
-                `Title: ${result.title}`,
-                `URL: ${result.url}`,
-                "Content:",
-                String(result.content || "").slice(0, 1500)
-            ].join("\n")
-        )
-        .join("\n\n");
 };
 
 const formatMemory = (facts) => {
@@ -194,56 +153,113 @@ const buildContents = (message, history) => {
     return contents;
 };
 
-async function* streamAIResponse({ message, history = [], facts = [], signal }) {
-    const contents = buildContents(message, history);
+const runSearchCall = async (call, sourceMap) => {
+    const query = String((call.args && call.args.query) || "").trim();
 
-    let systemInstruction =
-        BASE_SYSTEM_INSTRUCTION + formatDate() + formatMemory(facts);
+    if (call.name !== "search_web" || !query) {
+        return { error: "Unknown tool or empty query." };
+    }
 
-    if (needsWebSearch(message)) {
-        yield { type: "status", text: "Searching the web..." };
+    try {
+        const results = await searchWeb(query);
 
-        try {
-            const results = await searchWeb(`${message} as of today`);
-
-            systemInstruction = [
-                systemInstruction,
-                "",
-                WEB_CONTEXT_INTRO,
-                "",
-                formatSearchResults(results)
-            ].join("\n");
-
-            yield {
-                type: "sources",
-                sources: results.map((result) => ({
+        results.forEach((result) => {
+            if (result.url && !sourceMap.has(result.url)) {
+                sourceMap.set(result.url, {
                     title: result.title,
                     url: result.url
-                }))
-            };
-        } catch (error) {
-            console.error("Web search error:", error);
-        }
+                });
+            }
+        });
+
+        return {
+            results: results.map((result) => ({
+                title: result.title,
+                url: result.url,
+                content: String(result.content || "").slice(0, 1500)
+            }))
+        };
+    } catch (error) {
+        console.error("Web search error:", error);
+        return { error: "Web search failed. Answer from your own knowledge and say that live results were unavailable." };
     }
+};
+
+async function* streamAIResponse({ message, history = [], facts = [], signal }) {
+    const contents = buildContents(message, history);
+    const systemInstruction =
+        BASE_SYSTEM_INSTRUCTION + TOOL_GUIDE + formatDate() + formatMemory(facts);
+
+    const sourceMap = new Map();
+    let produced = false;
 
     yield { type: "status", text: "Thinking..." };
 
-    const stream = await ai.models.generateContentStream({
-        model: MODEL,
-        config: { systemInstruction, abortSignal: signal },
-        contents
-    });
+    for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+        const config = { systemInstruction, abortSignal: signal };
 
-    for await (const chunk of stream) {
-        if (signal && signal.aborted) {
+        if (round < MAX_TOOL_ROUNDS) {
+            config.tools = [{ functionDeclarations: [SEARCH_TOOL] }];
+        }
+
+        const stream = await ai.models.generateContentStream({
+            model: MODEL,
+            config,
+            contents
+        });
+
+        const modelParts = [];
+        const calls = [];
+
+        for await (const chunk of stream) {
+            if (signal && signal.aborted) {
+                return;
+            }
+
+            const candidate = chunk.candidates && chunk.candidates[0];
+            const parts = (candidate && candidate.content && candidate.content.parts) || [];
+
+            for (const part of parts) {
+                modelParts.push(part);
+
+                if (part.functionCall) {
+                    calls.push(part.functionCall);
+                } else if (part.text && !part.thought) {
+                    produced = true;
+                    yield { type: "token", text: part.text };
+                }
+            }
+        }
+
+        if (calls.length === 0) {
             break;
         }
 
-        const text = chunk.text;
+        yield { type: "status", text: "Searching the web..." };
 
-        if (text) {
-            yield { type: "token", text };
+        const responseParts = [];
+
+        for (const call of calls) {
+            const output = await runSearchCall(call, sourceMap);
+
+            const functionResponse = { name: call.name, response: output };
+
+            if (call.id) {
+                functionResponse.id = call.id;
+            }
+
+            responseParts.push({ functionResponse });
         }
+
+        contents.push({ role: "model", parts: modelParts });
+        contents.push({ role: "user", parts: responseParts });
+
+        yield { type: "sources", sources: Array.from(sourceMap.values()) };
+        yield { type: "status", text: "Thinking..." };
+    }
+
+    if (!produced) {
+        throw new Error("The model returned no text");
     }
 }
 
