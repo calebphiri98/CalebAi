@@ -5,7 +5,7 @@ const {
 } = require("../services/ai.service.js");
 const memory = require("../services/memory.service.js");
 
-const HISTORY_LIMIT = 20;
+const HISTORY_LIMIT = 10;
 
 const sendEvent = (res, payload) => {
     if (res.writableEnded || res.destroyed) {
