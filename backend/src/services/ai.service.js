@@ -5,6 +5,9 @@ const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY
 });
 
+const MODEL = "gemini-3.5-flash-lite";
+const TIMEZONE = process.env.TIMEZONE || "Africa/Blantyre";
+
 const SEARCH_KEYWORDS = [
     "current",
     "latest",
@@ -17,13 +20,23 @@ const SEARCH_KEYWORDS = [
     "this week",
     "this month",
     "this year",
-    "2026",
+    String(new Date().getFullYear()),
     "who is the current",
     "what is the latest",
     "latest version",
     "recent update",
-    "happening today"
+    "happening today",
+    "weather",
+    "search the web",
+    "look up"
 ];
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const SEARCH_PATTERN = new RegExp(
+    `\\b(${SEARCH_KEYWORDS.map(escapeRegExp).join("|")})\\b`,
+    "i"
+);
 
 const BASE_SYSTEM_INSTRUCTION = [
     "You are Caleb AI, a personal AI assistant being developed by Caleb.",
@@ -63,6 +76,15 @@ const BASE_SYSTEM_INSTRUCTION = [
     "- Explain difficult technical concepts in a way that is easy to understand.",
     "- Encourage understanding rather than simply giving answers.",
     "",
+    "Feedback and review:",
+    "- When the user asks for feedback on their work, be honest, specific and constructive.",
+    "- Say what works well, what should be improved and exactly how to improve it.",
+    "- Do not give empty praise.",
+    "",
+    "Daily assistance:",
+    "- Help with planning, writing, summarising, decisions, learning and everyday questions.",
+    "- When a request is simple, answer briefly. When it is complex, structure the answer.",
+    "",
     "Web information:",
     "- When web search results are provided, they are the primary source of information for the current question.",
     "- Directly answer the user's question using the web results.",
@@ -80,7 +102,9 @@ const BASE_SYSTEM_INSTRUCTION = [
     "Response style:",
     "- Be professional but friendly.",
     "- Do not unnecessarily repeat the user's question.",
-    "- Use headings, bullets and code blocks when they improve clarity."
+    "- Format answers in Markdown.",
+    "- Use headings, bullets and tables when they improve clarity.",
+    "- Put all code in fenced code blocks with the language name."
 ].join("\n");
 
 const WEB_CONTEXT_INTRO = [
@@ -100,9 +124,16 @@ const WEB_CONTEXT_INTRO = [
     "- Do not invent facts that are not supported by the search results."
 ].join("\n");
 
-const needsWebSearch = (message) => {
-    const lowerMessage = message.toLowerCase();
-    return SEARCH_KEYWORDS.some((keyword) => lowerMessage.includes(keyword));
+const needsWebSearch = (message) => SEARCH_PATTERN.test(message);
+
+const formatDate = () => {
+    const stamp = new Date().toLocaleString("en-GB", {
+        dateStyle: "full",
+        timeStyle: "short",
+        timeZone: TIMEZONE
+    });
+
+    return `\n\nCurrent date and time: ${stamp} (${TIMEZONE}).`;
 };
 
 const formatSearchResults = (results) => {
@@ -117,76 +148,173 @@ const formatSearchResults = (results) => {
                 `Title: ${result.title}`,
                 `URL: ${result.url}`,
                 "Content:",
-                result.content
+                String(result.content || "").slice(0, 1500)
             ].join("\n")
         )
         .join("\n\n");
 };
 
-const buildContents = (message, history) => {
-    const past = history.map((item) => ({
-        role: item.role === "ai" ? "model" : "user",
-        parts: [
-            {
-                text: item.text
-            }
-        ]
-    }));
-
-    const conversationContext = [
-        "CONVERSATION CONTEXT:",
-        "The messages below are previous messages from this conversation.",
-        "Use them to understand references such as he, she, they, it, this, that, and similar words.",
-        "",
-        ...history.map(
-            (item) =>
-                `${item.role === "ai" ? "Caleb AI" : "User"}: ${item.text}`
-        ),
-        "",
-        `CURRENT USER MESSAGE: ${message}`
-    ].join("\n");
-
-    return [
-        {
-            role: "user",
-            parts: [
-                {
-                    text: conversationContext
-                }
-            ]
-        }
-    ];
-};
-
-
-const generateAIResponse = async (message, history = []) => {
-    const contents = buildContents(message, history);
-
-    let systemInstruction = BASE_SYSTEM_INSTRUCTION;
-
-    if (needsWebSearch(message)) {
-        const searchQuery = `${message} as of today`;
-        const searchResults = await searchWeb(searchQuery);
-        const webContext = formatSearchResults(searchResults);
-
-        systemInstruction = [
-            BASE_SYSTEM_INSTRUCTION,
-            "",
-            WEB_CONTEXT_INTRO,
-            "",
-            webContext
-        ].join("\n");
+const formatMemory = (facts) => {
+    if (!facts || facts.length === 0) {
+        return "";
     }
 
-    const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash-lite",
-        config: { systemInstruction },
+    return [
+        "",
+        "",
+        "THINGS YOU REMEMBER ABOUT THE USER:",
+        ...facts.map((fact) => `- ${fact}`),
+        "",
+        "Use these naturally when they are relevant. Do not list them back unless the user asks what you remember."
+    ].join("\n");
+};
+
+const buildContents = (message, history) => {
+    const turns = [...history, { role: "user", text: message }].filter(
+        (turn) => turn.text && turn.text.trim()
+    );
+
+    const contents = [];
+
+    turns.forEach((turn) => {
+        const role = turn.role === "ai" ? "model" : "user";
+        const last = contents[contents.length - 1];
+
+        if (last && last.role === role) {
+            last.parts[0].text += `\n\n${turn.text}`;
+        } else {
+            contents.push({ role, parts: [{ text: turn.text }] });
+        }
+    });
+
+    while (contents.length > 0 && contents[0].role !== "user") {
+        contents.shift();
+    }
+
+    return contents;
+};
+
+async function* streamAIResponse({ message, history = [], facts = [], signal }) {
+    const contents = buildContents(message, history);
+
+    let systemInstruction =
+        BASE_SYSTEM_INSTRUCTION + formatDate() + formatMemory(facts);
+
+    if (needsWebSearch(message)) {
+        yield { type: "status", text: "Searching the web..." };
+
+        try {
+            const results = await searchWeb(`${message} as of today`);
+
+            systemInstruction = [
+                systemInstruction,
+                "",
+                WEB_CONTEXT_INTRO,
+                "",
+                formatSearchResults(results)
+            ].join("\n");
+
+            yield {
+                type: "sources",
+                sources: results.map((result) => ({
+                    title: result.title,
+                    url: result.url
+                }))
+            };
+        } catch (error) {
+            console.error("Web search error:", error);
+        }
+    }
+
+    yield { type: "status", text: "Thinking..." };
+
+    const stream = await ai.models.generateContentStream({
+        model: MODEL,
+        config: { systemInstruction, abortSignal: signal },
         contents
     });
 
-    return response.text ?? "";
+    for await (const chunk of stream) {
+        if (signal && signal.aborted) {
+            break;
+        }
+
+        const text = chunk.text;
+
+        if (text) {
+            yield { type: "token", text };
+        }
+    }
+}
+
+const extractFacts = async (message, existingFacts = []) => {
+    try {
+        const prompt = [
+            "Extract long-term facts about the user from the message below.",
+            "Only include stable personal facts or preferences, such as their name, what they study, projects they work on, skills, goals, tools they use, and how they like answers to be given.",
+            "Ignore questions, one-off requests and anything temporary.",
+            "Never include passwords, API keys, ID numbers, health details or financial details.",
+            "Return a JSON array of short strings written in the third person, for example [\"Studies Computer Science at MUBAS\"].",
+            "Return [] if there is nothing worth remembering.",
+            "",
+            "Already known facts:",
+            existingFacts.length
+                ? existingFacts.map((fact) => `- ${fact}`).join("\n")
+                : "- none",
+            "",
+            `Message: ${message}`
+        ].join("\n");
+
+        const response = await ai.models.generateContent({
+            model: MODEL,
+            config: { responseMimeType: "application/json" },
+            contents: prompt
+        });
+
+        const parsed = JSON.parse(response.text ?? "[]");
+
+        if (!Array.isArray(parsed)) {
+            return [];
+        }
+
+        return parsed
+            .filter((item) => typeof item === "string" && item.trim())
+            .map((item) => item.trim())
+            .slice(0, 5);
+    } catch (error) {
+        console.error("Fact extraction error:", error);
+        return [];
+    }
+};
+
+const generateTitle = async (message, reply) => {
+    try {
+        const prompt = [
+            "Write a short title of at most five words for a conversation that starts like this.",
+            "Return only the title, with no quotes and no full stop.",
+            "",
+            `User: ${message.slice(0, 500)}`,
+            `Assistant: ${reply.slice(0, 500)}`
+        ].join("\n");
+
+        const response = await ai.models.generateContent({
+            model: MODEL,
+            contents: prompt
+        });
+
+        return (response.text ?? "")
+            .replace(/["'*#\n]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 60);
+    } catch (error) {
+        console.error("Title error:", error);
+        return "";
+    }
 };
 
 module.exports = {
-    generateAIResponse
+    streamAIResponse,
+    extractFacts,
+    generateTitle
 };
