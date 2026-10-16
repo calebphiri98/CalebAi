@@ -1,147 +1,497 @@
-import { useState, useEffect, useRef } from "react";
-import "./App.css";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Markdown from "./Markdown.jsx";
+import { request, streamChat } from "./api.js";
 import {
-  MicIcon,
-  SendIcon,
-  StopIcon,
-  ThumbIcon,
-  CopyIcon,
   CheckIcon,
-  RefreshIcon,
-  SpeakerIcon,
-  PlusIcon,
-  MenuIcon,
-  TrashIcon,
-  PencilIcon,
-  MemoryIcon,
-  SunIcon,
-  MoonIcon,
   CloseIcon,
+  CopyIcon,
+  MemoryIcon,
+  MenuIcon,
+  MicIcon,
+  MoonIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshIcon,
+  SendIcon,
+  SpeakerIcon,
+  StopIcon,
+  SunIcon,
+  ThumbIcon,
+  TrashIcon,
 } from "./icons.jsx";
+import "./App.css";
+
+const SpeechRecognition =
+  window.SpeechRecognition || window.webkitSpeechRecognition;
 
 const SUGGESTIONS = [
-  "Help me write a Python script",
-  "Explain quantum computing simply",
-  "Plan a 3-day trip to Tokyo",
-  "What is happening in the world today?",
+  "Help me plan my study week",
+  "Explain a difficult concept in simple terms",
+  "Give me honest feedback on this: ",
+  "Help me debug my code",
 ];
 
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 days", "Older"];
 
-function groupLabel(dateString) {
-  if (!dateString) return "Older";
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffDays = Math.floor((now - date) / (1000 * 60 * 60 * 24));
+const groupLabel = (iso) => {
+  const startOfToday = new Date().setHours(0, 0, 0, 0);
+  const days = Math.round(
+    (startOfToday - new Date(iso).setHours(0, 0, 0, 0)) / 86400000
+  );
 
-  if (diffDays === 0) return "Today";
-  if (diffDays === 1) return "Yesterday";
-  if (diffDays <= 7) return "Previous 7 days";
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days <= 7) return "Previous 7 days";
   return "Older";
-}
+};
 
-function hostname(url) {
+const hostname = (url) => {
   try {
-    return new URL(url).hostname;
-  } catch {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch (error) {
+    console.error("URL error:", error);
     return url;
   }
-}
+};
 
-export default function App() {
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+const plainText = (text) =>
+  text
+    .replace(/```[\s\S]*?```/g, " code block ")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[*_#`>~|]/g, "");
+
+const dropTrailingAi = (list) => {
+  const copy = [...list];
+
+  while (copy.length > 0 && copy[copy.length - 1].role === "ai") {
+    copy.pop();
+  }
+
+  return copy;
+};
+
+const getInitialTheme = () => {
+  try {
+    const saved = localStorage.getItem("caleb-ai-theme");
+
+    if (saved === "light" || saved === "dark") return saved;
+  } catch (error) {
+    console.error("Theme error:", error);
+  }
+
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+};
+
+function App() {
   const [conversations, setConversations] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [messages, setMessages] = useState([]);
-  const [search, setSearch] = useState("");
-  const [theme, setTheme] = useState("dark");
+  const [facts, setFacts] = useState([]);
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
-  const [input, setInput] = useState("");
-  const [notice, setNotice] = useState("");
-  const [showMemory, setShowMemory] = useState(false);
-  const [facts, setFacts] = useState([]);
-  const [newFact, setNewFact] = useState("");
-  const [copiedId, setCopiedId] = useState(null);
-  const [speakingId, setSpeakingId] = useState(null);
   const [listening, setListening] = useState(false);
+  const [speakingId, setSpeakingId] = useState(null);
+  const [copiedId, setCopiedId] = useState(null);
+  const [showMemory, setShowMemory] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth > 800);
+  const [search, setSearch] = useState("");
+  const [newFact, setNewFact] = useState("");
+  const [notice, setNotice] = useState("");
+  const [theme, setTheme] = useState(getInitialTheme);
 
   const messagesRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const baseTextRef = useRef("");
+  const abortRef = useRef(null);
   const stickRef = useRef(true);
+  const loadingRef = useRef(false);
+  const activeIdRef = useRef(null);
+  const noticeTimerRef = useRef(null);
   const utteranceRef = useRef(null);
-  const abortControllerRef = useRef(null);
 
-  const showNotice = (msg) => {
-    setNotice(msg);
-    setTimeout(() => setNotice(""), 3000);
-  };
-
-  const request = async (url, options = {}) => {
-    const res = await fetch(`http://localhost:5000/api${url}`, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
-    });
-    if (!res.ok) throw new Error("API request failed");
-    return res.json();
-  };
-
-  // Load conversation list and memory facts on load
-  useEffect(() => {
-    request("/conversations")
-      .then((data) => {
-        if (data.success && data.conversations) {
-          setConversations(data.conversations);
-        }
-      })
-      .catch((err) => console.error("Failed to load conversations", err));
-
-    request("/memory")
-      .then((data) => {
-        if (data.success && data.facts) {
-          setFacts(data.facts);
-        }
-      })
-      .catch((err) => console.error("Failed to load memory", err));
+  const showNotice = useCallback((text) => {
+    setNotice(text);
+    clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setNotice(""), 4500);
   }, []);
 
-  // Auto-scroll to bottom on new message
-  useEffect(() => {
-    if (stickRef.current && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: "smooth" });
+  const refreshConversations = useCallback(async () => {
+    try {
+      const data = await request("/conversations");
+      setConversations(data.conversations);
+    } catch (error) {
+      console.error("Conversations error:", error);
     }
-  }, [messages, status]);
+  }, []);
+
+  const refreshMemory = useCallback(async () => {
+    try {
+      const data = await request("/memory");
+      setFacts(data.facts);
+    } catch (error) {
+      console.error("Memory error:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+
+    try {
+      localStorage.setItem("caleb-ai-theme", theme);
+    } catch (error) {
+      console.error("Theme error:", error);
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    const init = async () => {
+      try {
+        const [list, memory] = await Promise.all([
+          request("/conversations"),
+          request("/memory"),
+        ]);
+
+        setConversations(list.conversations);
+        setFacts(memory.facts);
+
+        if (list.conversations.length > 0) {
+          const first = list.conversations[0];
+          const data = await request(`/conversations/${first.id}`);
+
+          setActiveId(first.id);
+          setMessages(data.conversation.messages);
+        }
+      } catch (error) {
+        console.error("Load error:", error);
+        showNotice("Could not load your chats. Is the backend running?");
+      }
+    };
+
+    init();
+  }, [showNotice]);
+
+  useEffect(() => {
+    if (stickRef.current) {
+      bottomRef.current?.scrollIntoView({
+        behavior: loading ? "auto" : "smooth",
+      });
+    }
+  }, [messages, status, loading]);
+
+  useEffect(() => {
+    const element = textareaRef.current;
+
+    if (!element) return;
+
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, 180)}px`;
+  }, [input]);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      recognitionRef.current?.abort();
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
+
+  const handleScroll = () => {
+    const element = messagesRef.current;
+
+    if (!element) return;
+
+    stickRef.current =
+      element.scrollHeight - element.scrollTop - element.clientHeight < 140;
+  };
 
   const stopGeneration = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    setLoading(false);
-    setStatus("");
+    abortRef.current?.abort();
   };
 
   const stopSpeaking = () => {
-    if (window.speechSynthesis) {
-      window.speechSynthesis.cancel();
-    }
     utteranceRef.current = null;
+    window.speechSynthesis?.cancel();
     setSpeakingId(null);
   };
 
+  const startListening = () => {
+    if (!SpeechRecognition) {
+      showNotice("Voice input is not supported in this browser. Use Chrome or Edge.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+
+    recognition.lang = navigator.language || "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+
+    baseTextRef.current = input.trim() ? `${input.trim()} ` : "";
+
+    recognition.onresult = (event) => {
+      let transcript = "";
+
+      for (let index = 0; index < event.results.length; index += 1) {
+        transcript += event.results[index][0].transcript;
+      }
+
+      setInput(baseTextRef.current + transcript);
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === "not-allowed") {
+        showNotice("Microphone access was blocked. Allow it in your browser settings.");
+      } else if (event.error !== "no-speech" && event.error !== "aborted") {
+        showNotice(`Voice input error: ${event.error}`);
+      }
+
+      setListening(false);
+    };
+
+    recognition.onend = () => setListening(false);
+
+    recognition.start();
+    recognitionRef.current = recognition;
+    setListening(true);
+  };
+
+  const stopListening = () => {
+    recognitionRef.current?.stop();
+    setListening(false);
+  };
+
+  const streamReply = async ({ text, regenerate = false }) => {
+    const controller = new AbortController();
+    const stamp = Date.now();
+    const draftId = `draft-${stamp}`;
+    const localUserId = `local-${stamp}`;
+    let conversationId = activeId;
+
+    abortRef.current = controller;
+    stickRef.current = true;
+    setLoading(true);
+    setStatus("");
+
+    setMessages((previous) => {
+      const base = regenerate ? dropTrailingAi(previous) : previous;
+      const added = [];
+
+      if (!regenerate) {
+        added.push({
+          id: localUserId,
+          role: "user",
+          text,
+          feedback: null,
+          local: true,
+        });
+      }
+
+      added.push({
+        id: draftId,
+        role: "ai",
+        text: "",
+        feedback: null,
+        local: true,
+        sources: [],
+      });
+
+      return [...base, ...added];
+    });
+
+    const updateDraft = (change) => {
+      setMessages((previous) =>
+        previous.map((item) =>
+          item.id === draftId ? { ...item, ...change(item) } : item
+        )
+      );
+    };
+
+    try {
+      await streamChat({
+        body: { conversationId, message: text, regenerate },
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (event.type === "meta") {
+            conversationId = event.conversationId;
+            setActiveId(event.conversationId);
+
+            if (event.userMessage) {
+              setMessages((previous) =>
+                previous.map((item) =>
+                  item.id === localUserId ? event.userMessage : item
+                )
+              );
+            }
+
+            refreshConversations();
+          } else if (event.type === "status") {
+            setStatus(event.text);
+          } else if (event.type === "sources") {
+            updateDraft(() => ({ sources: event.sources }));
+          } else if (event.type === "token") {
+            setStatus("");
+            updateDraft((item) => ({ text: item.text + event.text }));
+          } else if (event.type === "error") {
+            showNotice(event.message);
+          } else if (event.type === "done") {
+            setMessages((previous) =>
+              event.message
+                ? previous.map((item) =>
+                    item.id === draftId ? event.message : item
+                  )
+                : previous.filter((item) => item.id !== draftId || item.text)
+            );
+          }
+        },
+      });
+    } catch (error) {
+      if (error.name === "AbortError") {
+        setMessages((previous) =>
+          previous
+            .filter((item) => item.id !== draftId || item.text)
+            .map((item) =>
+              item.id === draftId ? { ...item, stopped: true } : item
+            )
+        );
+
+        const savedId = conversationId;
+
+        if (savedId) {
+          setTimeout(async () => {
+            if (loadingRef.current || activeIdRef.current !== savedId) return;
+
+            try {
+              const data = await request(`/conversations/${savedId}`);
+              setMessages(data.conversation.messages);
+            } catch (reloadError) {
+              console.error("Reload error:", reloadError);
+            }
+          }, 700);
+        }
+      } else {
+        console.error("Chat error:", error);
+
+        showNotice(
+          error.message === "Failed to fetch"
+            ? "Could not reach Caleb AI. Is the backend running?"
+            : error.message
+        );
+
+        setMessages((previous) =>
+          previous.filter((item) => item.id !== draftId || item.text)
+        );
+      }
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setLoading(false);
+        setStatus("");
+      }
+
+      refreshConversations();
+      setTimeout(refreshConversations, 3500);
+      setTimeout(refreshMemory, 4500);
+    }
+  };
+
+  const sendMessage = () => {
+    const text = input.trim();
+
+    if (!text || loading) return;
+
+    if (listening) stopListening();
+
+    setInput("");
+    streamReply({ text });
+  };
+
+  const regenerate = () => {
+    if (loading || !activeId) return;
+
+    streamReply({ text: "", regenerate: true });
+  };
+
+  const pickSuggestion = (text) => {
+    setInput(text);
+    textareaRef.current?.focus();
+  };
+
+  const giveFeedback = async (item, rating) => {
+    const next = item.feedback === rating ? null : rating;
+    const previousRating = item.feedback;
+
+    setMessages((previous) =>
+      previous.map((entry) =>
+        entry.id === item.id ? { ...entry, feedback: next } : entry
+      )
+    );
+
+    try {
+      await request("/feedback", {
+        method: "POST",
+        body: JSON.stringify({
+          conversationId: activeId,
+          messageId: item.id,
+          rating: next,
+        }),
+      });
+    } catch (error) {
+      console.error("Feedback error:", error);
+
+      setMessages((previous) =>
+        previous.map((entry) =>
+          entry.id === item.id ? { ...entry, feedback: previousRating } : entry
+        )
+      );
+
+      showNotice("Could not save feedback.");
+    }
+  };
+
+  const copyMessage = async (item) => {
+    try {
+      await navigator.clipboard.writeText(item.text);
+      setCopiedId(item.id);
+      setTimeout(() => setCopiedId(null), 1500);
+    } catch (error) {
+      console.error("Copy error:", error);
+      showNotice("Could not copy the message.");
+    }
+  };
+
   const speak = (item) => {
-    if (!window.speechSynthesis) return;
+    if (!("speechSynthesis" in window)) {
+      showNotice("Read aloud is not supported in this browser.");
+      return;
+    }
+
     if (speakingId === item.id) {
       stopSpeaking();
       return;
     }
-    stopSpeaking();
-    const utterance = new SpeechSynthesisUtterance(item.text);
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(plainText(item.text));
+
     const finish = () => {
-      utteranceRef.current = null;
-      setSpeakingId(null);
+      if (utteranceRef.current === utterance) {
+        utteranceRef.current = null;
+        setSpeakingId(null);
+      }
     };
 
     utterance.onend = finish;
@@ -177,11 +527,10 @@ export default function App() {
 
     try {
       const data = await request(`/conversations/${id}`);
-      if (data.success && data.conversation) {
-        setActiveId(id);
-        setMessages(data.conversation.messages);
-        stickRef.current = true;
-      }
+
+      setActiveId(id);
+      setMessages(data.conversation.messages);
+      stickRef.current = true;
     } catch (error) {
       console.error("Open error:", error);
       showNotice("Could not open that chat.");
@@ -192,6 +541,7 @@ export default function App() {
 
   const renameConversation = async (conversation) => {
     const title = window.prompt("Rename chat", conversation.title);
+
     if (!title || !title.trim()) return;
 
     try {
@@ -235,6 +585,7 @@ export default function App() {
 
   const addFact = async () => {
     const text = newFact.trim();
+
     if (!text) return;
 
     try {
@@ -243,10 +594,8 @@ export default function App() {
         body: JSON.stringify({ text }),
       });
 
-      if (data.success) {
-        setFacts(data.facts);
-        setNewFact("");
-      }
+      setFacts(data.facts);
+      setNewFact("");
     } catch (error) {
       console.error("Add memory error:", error);
       showNotice("Could not save that memory.");
@@ -275,200 +624,6 @@ export default function App() {
     }
   };
 
-  const pickSuggestion = (text) => {
-    setInput(text);
-    textareaRef.current?.focus();
-  };
-
-  const copyMessage = async (item) => {
-    try {
-      await navigator.clipboard.writeText(item.text);
-      setCopiedId(item.id);
-      setTimeout(() => setCopiedId(null), 1500);
-    } catch (err) {
-      console.error("Copy failed", err);
-    }
-  };
-
-  const giveFeedback = async (item, rating) => {
-    try {
-      await request("/feedback", {
-        method: "POST",
-        body: JSON.stringify({
-          conversationId: activeId,
-          messageId: item.id,
-          rating,
-        }),
-      });
-      setMessages((prev) =>
-        prev.map((m) => (m.id === item.id ? { ...m, feedback: rating } : m))
-      );
-    } catch (err) {
-      console.error("Feedback error", err);
-    }
-  };
-
-  const startListening = () => {
-    if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
-      showNotice("Speech recognition is not supported in this browser.");
-      return;
-    }
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-
-    recognition.onstart = () => setListening(true);
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
-      setListening(false);
-    };
-    recognition.onerror = () => setListening(false);
-    recognition.onend = () => setListening(false);
-
-    recognition.start();
-  };
-
-  const stopListening = () => {
-    setListening(false);
-  };
-
-  const sendMessage = async (isRegenerate = false, overrideText = null) => {
-    const textToSend = overrideText !== null ? overrideText : input;
-    if ((!textToSend.trim() && !isRegenerate) || loading) return;
-
-    if (!isRegenerate) {
-      setInput("");
-    }
-
-    setLoading(true);
-    setStatus("Connecting...");
-
-    const tempUserMsgId = Date.now();
-    const tempAiMsgId = Date.now() + 1;
-
-    if (!isRegenerate) {
-      setMessages((prev) => [
-        ...prev,
-        { id: tempUserMsgId, role: "user", text: textToSend },
-      ]);
-    }
-
-    setMessages((prev) => [
-      ...prev,
-      { id: tempAiMsgId, role: "ai", text: "", sources: [] },
-    ]);
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    try {
-      const response = await fetch("http://localhost:5000/api/chat/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          conversationId: activeId,
-          text: textToSend,
-          regenerate: isRegenerate,
-        }),
-      });
-
-      if (!response.ok) throw new Error("Stream connection failed");
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop();
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-
-          try {
-            const eventData = JSON.parse(trimmed.replace(/^data:\s*/, ""));
-
-            if (eventData.type === "meta") {
-              setActiveId(eventData.conversationId);
-              request("/conversations").then((d) => {
-                if (d.success) setConversations(d.conversations);
-              });
-            } else if (eventData.type === "status") {
-              setStatus(eventData.text);
-            } else if (eventData.type === "token") {
-              setStatus("");
-              setMessages((prev) =>
-                prev.map((msg) =>
-                  msg.id === tempAiMsgId
-                    ? { ...msg, text: msg.text + eventData.text }
-                    : msg
-                )
-              );
-            } else if (eventData.type === "sources") {
-              setMessages((prev) =>
-                prev.map((msg) =>
-                  msg.id === tempAiMsgId
-                    ? { ...msg, sources: eventData.sources }
-                    : msg
-                )
-              );
-            } else if (eventData.type === "done") {
-              if (eventData.message) {
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === tempAiMsgId ? { ...eventData.message } : msg
-                  )
-                );
-              }
-              // Refresh facts panel in case memory facts were auto-extracted
-              request("/memory").then((d) => {
-                if (d.success) setFacts(d.facts);
-              });
-            }
-          } catch (e) {
-            console.error("SSE parse error", e);
-          }
-        }
-      }
-    } catch (error) {
-      if (error.name !== "AbortError") {
-        console.error("Send message error:", error);
-        showNotice("Failed to get response from Caleb AI.");
-      }
-    } finally {
-      setLoading(false);
-      setStatus("");
-      abortControllerRef.current = null;
-    }
-  };
-
-  const regenerate = () => {
-    if (loading || !activeId) return;
-    setMessages((prev) => {
-      const copy = [...prev];
-      if (copy.length > 0 && copy[copy.length - 1].role === "ai") {
-        copy.pop();
-      }
-      return copy;
-    });
-    sendMessage(true, "");
-  };
-
-  const handleScroll = () => {
-    if (!messagesRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = messagesRef.current;
-    stickRef.current = scrollHeight - scrollTop - clientHeight < 50;
-  };
-
   const filtered = conversations.filter((item) =>
     item.title.toLowerCase().includes(search.trim().toLowerCase())
   );
@@ -482,7 +637,7 @@ export default function App() {
     conversations.find((item) => item.id === activeId)?.title || "New chat";
 
   return (
-    <div className={`app ${theme}`}>
+    <div className="app">
       {sidebarOpen && (
         <div className="backdrop" onClick={() => setSidebarOpen(false)}></div>
       )}
@@ -744,7 +899,7 @@ export default function App() {
 
             <button
               className="icon-button send"
-              onClick={() => sendMessage()}
+              onClick={sendMessage}
               disabled={loading || !input.trim()}
               title={loading ? "Wait for the reply to finish" : "Send"}
             >
@@ -812,3 +967,5 @@ export default function App() {
     </div>
   );
 }
+
+export default App;
