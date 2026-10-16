@@ -5,9 +5,16 @@ const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY
 });
 
-const MODEL = "gemini-3.5-flash-lite";
+const MODEL = "gemini-3-flash-preview";
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "";
 const TIMEZONE = process.env.TIMEZONE || "Africa/Blantyre";
 const MAX_TOOL_ROUNDS = 3;
+const MAX_SOURCES = 4;
+const SOURCE_CHARS = 800;
+const ATTEMPTS_PER_MODEL = 2;
+const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
+
+const FAST_THINKING = { thinkingLevel: "minimal" };
 
 const SEARCH_TOOL = {
     name: "search_web",
@@ -103,6 +110,8 @@ const TOOL_GUIDE = [
     "- Never invent or call any tool other than search_web."
 ].join("\n");
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const formatDate = () => {
     const stamp = new Date().toLocaleString("en-GB", {
         dateStyle: "full",
@@ -153,6 +162,51 @@ const buildContents = (message, history) => {
     return contents;
 };
 
+const buildConfig = (model, systemInstruction, signal, withTools) => {
+    const config = { systemInstruction, abortSignal: signal };
+
+    if (model === MODEL) {
+        config.thinkingConfig = FAST_THINKING;
+    }
+
+    if (withTools) {
+        config.tools = [{ functionDeclarations: [SEARCH_TOOL] }];
+    }
+
+    return config;
+};
+
+const openStream = async ({ contents, systemInstruction, signal, withTools }) => {
+    const models = [MODEL, FALLBACK_MODEL].filter(Boolean);
+    let lastError = null;
+
+    for (const model of models) {
+        for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt += 1) {
+            try {
+                return await ai.models.generateContentStream({
+                    model,
+                    config: buildConfig(model, systemInstruction, signal, withTools),
+                    contents
+                });
+            } catch (error) {
+                lastError = error;
+
+                if ((signal && signal.aborted) || !RETRYABLE_STATUS.has(error.status)) {
+                    throw error;
+                }
+
+                console.log(
+                    `Model ${model} returned ${error.status} (attempt ${attempt} of ${ATTEMPTS_PER_MODEL})`
+                );
+
+                await sleep(700 * attempt);
+            }
+        }
+    }
+
+    throw lastError;
+};
+
 const runSearchCall = async (call, sourceMap) => {
     const query = String((call.args && call.args.query) || "").trim();
 
@@ -161,7 +215,7 @@ const runSearchCall = async (call, sourceMap) => {
     }
 
     try {
-        const results = await searchWeb(query);
+        const results = (await searchWeb(query)).slice(0, MAX_SOURCES);
 
         results.forEach((result) => {
             if (result.url && !sourceMap.has(result.url)) {
@@ -176,7 +230,7 @@ const runSearchCall = async (call, sourceMap) => {
             results: results.map((result) => ({
                 title: result.title,
                 url: result.url,
-                content: String(result.content || "").slice(0, 1500)
+                content: String(result.content || "").slice(0, SOURCE_CHARS)
             }))
         };
     } catch (error) {
@@ -191,21 +245,18 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
         BASE_SYSTEM_INSTRUCTION + TOOL_GUIDE + formatDate() + formatMemory(facts);
 
     const sourceMap = new Map();
+    const startedAt = Date.now();
     let produced = false;
+    let firstTokenLogged = false;
 
     yield { type: "status", text: "Thinking..." };
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-        const config = { systemInstruction, abortSignal: signal };
-
-        if (round < MAX_TOOL_ROUNDS) {
-            config.tools = [{ functionDeclarations: [SEARCH_TOOL] }];
-        }
-
-        const stream = await ai.models.generateContentStream({
-            model: MODEL,
-            config,
-            contents
+        const stream = await openStream({
+            contents,
+            systemInstruction,
+            signal,
+            withTools: round < MAX_TOOL_ROUNDS
         });
 
         const modelParts = [];
@@ -226,6 +277,14 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
                     calls.push(part.functionCall);
                 } else if (part.text && !part.thought) {
                     produced = true;
+
+                    if (!firstTokenLogged) {
+                        firstTokenLogged = true;
+                        console.log(
+                            `First token after ${Date.now() - startedAt} ms (round ${round + 1})`
+                        );
+                    }
+
                     yield { type: "token", text: part.text };
                 }
             }
@@ -237,6 +296,7 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
 
         yield { type: "status", text: "Searching the web..." };
 
+        const searchStarted = Date.now();
         const responseParts = [];
 
         for (const call of calls) {
@@ -251,6 +311,8 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
             responseParts.push({ functionResponse });
         }
 
+        console.log(`Web search took ${Date.now() - searchStarted} ms`);
+
         contents.push({ role: "model", parts: modelParts });
         contents.push({ role: "user", parts: responseParts });
 
@@ -258,12 +320,32 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
         yield { type: "status", text: "Thinking..." };
     }
 
+    console.log(`Full reply finished after ${Date.now() - startedAt} ms`);
+
     if (!produced) {
         throw new Error("The model returned no text");
     }
 }
 
+const worthRemembering = (message) => {
+    const text = String(message || "").trim();
+
+    if (text.length < 25) {
+        return false;
+    }
+
+    if (text.endsWith("?")) {
+        return false;
+    }
+
+    return true;
+};
+
 const extractFacts = async (message, existingFacts = []) => {
+    if (!worthRemembering(message)) {
+        return [];
+    }
+
     try {
         const prompt = [
             "Extract long-term facts about the user from the message below.",
@@ -283,7 +365,10 @@ const extractFacts = async (message, existingFacts = []) => {
 
         const response = await ai.models.generateContent({
             model: MODEL,
-            config: { responseMimeType: "application/json" },
+            config: {
+                responseMimeType: "application/json",
+                thinkingConfig: FAST_THINKING
+            },
             contents: prompt
         });
 
@@ -315,6 +400,7 @@ const generateTitle = async (message, reply) => {
 
         const response = await ai.models.generateContent({
             model: MODEL,
+            config: { thinkingConfig: FAST_THINKING },
             contents: prompt
         });
 
