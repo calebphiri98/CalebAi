@@ -176,7 +176,7 @@ function App() {
         }
       } catch (error) {
         console.error("Load error:", error);
-        showNotice("Could not load your chats. Is the backend running?");
+        showNotice("You might be experiencing poor or slow network?");
       }
     };
 
