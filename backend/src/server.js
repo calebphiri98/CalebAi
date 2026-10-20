@@ -8,8 +8,6 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
-
-// Mount the AI routes under /api
 app.use('/api', aiRoutes);
 
 app.get('/', (req, res) => {
