@@ -6,15 +6,33 @@ const ai = new GoogleGenAI({
 });
 
 const MODEL = "gemini-3-flash-preview";
-const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "";
+const FALLBACK_MODELS = (process.env.FALLBACK_MODELS || process.env.FALLBACK_MODEL || "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
 const TIMEZONE = process.env.TIMEZONE || "Africa/Blantyre";
 const MAX_TOOL_ROUNDS = 3;
 const MAX_SOURCES = 4;
 const SOURCE_CHARS = 800;
-const ATTEMPTS_PER_MODEL = 2;
-const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
+const FIRST_TOKEN_TIMEOUT_MS = Number(process.env.FIRST_TOKEN_TIMEOUT_MS) || 12000;
+const MAX_MODELS_PER_REQUEST = 4;
+const BUSY_ATTEMPTS = 2;
+const BUSY_STATUS = new Set([500, 503, 504]);
+
+const COOLDOWN_MS = {
+    timeout: 60000,
+    busy: 30000,
+    missing: 3600000,
+    quotaMin: 5000,
+    quotaMax: 12 * 3600000
+};
+
+const cooldowns = new Map();
 
 const FAST_THINKING = { thinkingLevel: "minimal" };
+
+const PERSONAL_PATTERN =
+    /\b(i am|i'm|im|my name|call me|i study|i work|i live|i like|i love|i prefer|i use|i want|my project|my goal|my course|remember that)\b/i;
 
 const SEARCH_TOOL = {
     name: "search_web",
@@ -112,6 +130,49 @@ const TOOL_GUIDE = [
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const coolDown = (model, ms) => {
+    cooldowns.set(model, Date.now() + ms);
+};
+
+const isCoolingDown = (model) => {
+    const until = cooldowns.get(model);
+
+    if (!until) {
+        return false;
+    }
+
+    if (Date.now() >= until) {
+        cooldowns.delete(model);
+        return false;
+    }
+
+    return true;
+};
+
+const quotaDelayMs = (error) => {
+    const match = /retry in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(
+        String(error.message || "")
+    );
+
+    if (!match) {
+        return 60000;
+    }
+
+    const seconds =
+        (Number(match[1]) || 0) * 3600 +
+        (Number(match[2]) || 0) * 60 +
+        (Number(match[3]) || 0);
+
+    return Math.min(Math.max(seconds * 1000, COOLDOWN_MS.quotaMin), COOLDOWN_MS.quotaMax);
+};
+
+const pickModels = () => {
+    const all = Array.from(new Set([MODEL, ...FALLBACK_MODELS]));
+    const ready = all.filter((model) => !isCoolingDown(model));
+
+    return (ready.length > 0 ? ready : all).slice(0, MAX_MODELS_PER_REQUEST);
+};
+
 const formatDate = () => {
     const stamp = new Date().toLocaleString("en-GB", {
         dateStyle: "full",
@@ -162,8 +223,8 @@ const buildContents = (message, history) => {
     return contents;
 };
 
-const buildConfig = (model, systemInstruction, signal, withTools) => {
-    const config = { systemInstruction, abortSignal: signal };
+const buildConfig = (model, systemInstruction, abortSignal, withTools) => {
+    const config = { systemInstruction, abortSignal };
 
     if (model === MODEL) {
         config.thinkingConfig = FAST_THINKING;
@@ -177,35 +238,117 @@ const buildConfig = (model, systemInstruction, signal, withTools) => {
 };
 
 const openStream = async ({ contents, systemInstruction, signal, withTools }) => {
-    const models = [MODEL, FALLBACK_MODEL].filter(Boolean);
     let lastError = null;
 
-    for (const model of models) {
-        for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt += 1) {
+    for (const model of pickModels()) {
+        for (let attempt = 1; attempt <= BUSY_ATTEMPTS; attempt += 1) {
+            if (signal && signal.aborted) {
+                throw new Error("Request aborted");
+            }
+
+            const attemptController = new AbortController();
+            const forwardAbort = () => attemptController.abort();
+            let timedOut = false;
+
+            if (signal) {
+                signal.addEventListener("abort", forwardAbort, { once: true });
+            }
+
+            const timer = setTimeout(() => {
+                timedOut = true;
+                attemptController.abort();
+            }, FIRST_TOKEN_TIMEOUT_MS);
+
             try {
-                return await ai.models.generateContentStream({
+                const stream = await ai.models.generateContentStream({
                     model,
-                    config: buildConfig(model, systemInstruction, signal, withTools),
+                    config: buildConfig(
+                        model,
+                        systemInstruction,
+                        attemptController.signal,
+                        withTools
+                    ),
                     contents
                 });
+
+                const iterator = stream[Symbol.asyncIterator]();
+                const first = await iterator.next();
+
+                clearTimeout(timer);
+
+                return { model, first, iterator };
             } catch (error) {
+                clearTimeout(timer);
+
+                if (signal) {
+                    signal.removeEventListener("abort", forwardAbort);
+                }
+
                 lastError = error;
 
-                if ((signal && signal.aborted) || !RETRYABLE_STATUS.has(error.status)) {
+                if (signal && signal.aborted) {
+                    throw error;
+                }
+
+                if (timedOut) {
+                    console.log(
+                        `Model ${model} gave no answer within ${FIRST_TOKEN_TIMEOUT_MS} ms, trying the next model`
+                    );
+                    coolDown(model, COOLDOWN_MS.timeout);
+                    lastError = Object.assign(new Error("Model timed out"), { status: 503 });
+                    break;
+                }
+
+                if (error.status === 429) {
+                    const wait = quotaDelayMs(error);
+                    console.log(
+                        `Model ${model} is out of quota, skipping it for ${Math.round(wait / 1000)} s`
+                    );
+                    coolDown(model, wait);
+                    break;
+                }
+
+                if (error.status === 404) {
+                    console.log(`Model ${model} was not found, skipping it`);
+                    coolDown(model, COOLDOWN_MS.missing);
+                    break;
+                }
+
+                if (error.status && !BUSY_STATUS.has(error.status)) {
                     throw error;
                 }
 
                 console.log(
-                    `Model ${model} returned ${error.status} (attempt ${attempt} of ${ATTEMPTS_PER_MODEL})`
+                    `Model ${model} failed with ${error.status || "a network error"} (attempt ${attempt} of ${BUSY_ATTEMPTS})`
                 );
 
-                await sleep(700 * attempt);
+                if (attempt === BUSY_ATTEMPTS) {
+                    coolDown(model, COOLDOWN_MS.busy);
+                } else {
+                    await sleep(700 * attempt);
+                }
             }
         }
     }
 
-    throw lastError;
+    throw lastError || new Error("No model available");
 };
+
+async function* chunksFrom(opened) {
+    if (!opened.first.done) {
+        yield opened.first.value;
+    }
+
+    while (true) {
+        const next = await opened.iterator.next();
+
+        if (next.done) {
+            return;
+        }
+
+        yield next.value;
+    }
+}
 
 const runSearchCall = async (call, sourceMap) => {
     const query = String((call.args && call.args.query) || "").trim();
@@ -252,7 +395,7 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
     yield { type: "status", text: "Thinking..." };
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-        const stream = await openStream({
+        const opened = await openStream({
             contents,
             systemInstruction,
             signal,
@@ -262,7 +405,7 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
         const modelParts = [];
         const calls = [];
 
-        for await (const chunk of stream) {
+        for await (const chunk of chunksFrom(opened)) {
             if (signal && signal.aborted) {
                 return;
             }
@@ -281,7 +424,7 @@ async function* streamAIResponse({ message, history = [], facts = [], signal }) 
                     if (!firstTokenLogged) {
                         firstTokenLogged = true;
                         console.log(
-                            `First token after ${Date.now() - startedAt} ms (round ${round + 1})`
+                            `First token after ${Date.now() - startedAt} ms from ${opened.model} (round ${round + 1})`
                         );
                     }
 
@@ -338,7 +481,7 @@ const worthRemembering = (message) => {
         return false;
     }
 
-    return true;
+    return PERSONAL_PATTERN.test(text);
 };
 
 const extractFacts = async (message, existingFacts = []) => {
@@ -383,36 +526,25 @@ const extractFacts = async (message, existingFacts = []) => {
             .map((item) => item.trim())
             .slice(0, 5);
     } catch (error) {
-        console.error("Fact extraction error:", error);
+        console.error("Fact extraction error:", error.status || "", String(error.message).slice(0, 120));
         return [];
     }
 };
 
-const generateTitle = async (message, reply) => {
-    try {
-        const prompt = [
-            "Write a short title of at most five words for a conversation that starts like this.",
-            "Return only the title, with no quotes and no full stop.",
-            "",
-            `User: ${message.slice(0, 500)}`,
-            `Assistant: ${reply.slice(0, 500)}`
-        ].join("\n");
+const generateTitle = async (message) => {
+    const words = String(message || "")
+        .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 6);
 
-        const response = await ai.models.generateContent({
-            model: MODEL,
-            config: { thinkingConfig: FAST_THINKING },
-            contents: prompt
-        });
+    const title = words.join(" ");
 
-        return (response.text ?? "")
-            .replace(/["'*#\n]/g, " ")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 60);
-    } catch (error) {
-        console.error("Title error:", error);
+    if (!title) {
         return "";
     }
+
+    return title.charAt(0).toUpperCase() + title.slice(1);
 };
 
 module.exports = {
