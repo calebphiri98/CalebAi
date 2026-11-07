@@ -1,231 +1,276 @@
-const fs = require("fs");
-const path = require("path");
 const { randomUUID } = require("crypto");
+const { query } = require("./db.js");
 
-const DATA_DIR = path.join(__dirname, "..", "..", "data");
-const DATA_FILE = path.join(DATA_DIR, "store.json");
 const DEFAULT_TITLE = "New chat";
+const FACT_LIMIT = 100;
+const UUID_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const now = () => new Date().toISOString();
+const isUuid = (value) => UUID_PATTERN.test(String(value || ""));
 
-const emptyStore = () => ({ conversations: [], facts: [] });
-
-const normalise = (parsed) => {
-    const store = {
-        conversations: Array.isArray(parsed.conversations) ? parsed.conversations : [],
-        facts: Array.isArray(parsed.facts) ? parsed.facts : []
-    };
-
-    if (
-        store.conversations.length === 0 &&
-        Array.isArray(parsed.messages) &&
-        parsed.messages.length > 0
-    ) {
-        const first = parsed.messages[0];
-        const last = parsed.messages[parsed.messages.length - 1];
-
-        store.conversations.push({
-            id: randomUUID(),
-            title: "Previous chat",
-            createdAt: first.createdAt || now(),
-            updatedAt: last.createdAt || now(),
-            messages: parsed.messages
-        });
-    }
-
-    return store;
-};
-
-const load = () => {
-    if (!fs.existsSync(DATA_FILE)) {
-        return emptyStore();
-    }
-
-    try {
-        return normalise(JSON.parse(fs.readFileSync(DATA_FILE, "utf8")));
-    } catch (error) {
-        console.error("Memory load error:", error);
-
-        try {
-            fs.copyFileSync(DATA_FILE, `${DATA_FILE}.corrupt-${Date.now()}`);
-        } catch (copyError) {
-            console.error("Backup error:", copyError);
-        }
-
-        return emptyStore();
-    }
-};
-
-const save = (store) => {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2));
-};
-
-const findConversation = (store, id) =>
-    store.conversations.find((item) => item.id === id);
-
-const summarise = (conversation) => ({
-    id: conversation.id,
-    title: conversation.title,
-    createdAt: conversation.createdAt,
-    updatedAt: conversation.updatedAt,
-    messageCount: conversation.messages.length
+const toConversation = (row) => ({
+    id: row.id,
+    title: row.title,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
 });
 
-const listConversations = () =>
-    load()
-        .conversations.map(summarise)
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-
-const createConversation = (title = DEFAULT_TITLE) => {
-    const store = load();
-    const timestamp = now();
-
-    const conversation = {
-        id: randomUUID(),
-        title,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        messages: []
-    };
-
-    store.conversations.push(conversation);
-    save(store);
-
-    return conversation;
-};
-
-const getConversation = (id) => findConversation(load(), id) || null;
-
-const renameConversation = (id, title) => {
-    const store = load();
-    const conversation = findConversation(store, id);
-
-    if (!conversation) {
-        return null;
-    }
-
-    conversation.title = title;
-    save(store);
-
-    return summarise(conversation);
-};
-
-const deleteConversation = (id) => {
-    const store = load();
-    const before = store.conversations.length;
-
-    store.conversations = store.conversations.filter((item) => item.id !== id);
-    save(store);
-
-    return store.conversations.length < before;
-};
-
-const addMessage = (conversationId, role, text, extra = {}) => {
-    const store = load();
-    const conversation = findConversation(store, conversationId);
-
-    if (!conversation) {
-        return null;
-    }
-
+const toMessage = (row) => {
     const message = {
-        id: randomUUID(),
-        role,
-        text,
-        feedback: null,
-        createdAt: now(),
-        ...extra
+        id: row.id,
+        role: row.role,
+        text: row.text,
+        feedback: row.feedback,
+        createdAt: row.created_at.toISOString()
     };
 
-    conversation.messages.push(message);
-    conversation.updatedAt = now();
-    save(store);
+    if (row.role === "ai") {
+        message.sources = row.sources || [];
+        message.stopped = row.stopped;
+    }
 
     return message;
 };
 
-const prepareRegeneration = (conversationId) => {
-    const store = load();
-    const conversation = findConversation(store, conversationId);
+const toFact = (row) => ({
+    id: row.id,
+    text: row.text,
+    createdAt: row.created_at.toISOString()
+});
 
-    if (!conversation) {
-        return null;
-    }
+const listConversations = async (ownerId) => {
+    const result = await query(
+        `SELECT c.id, c.title, c.created_at, c.updated_at,
+                (SELECT COUNT(*) FROM caleb_messages m WHERE m.conversation_id = c.id) AS message_count
+         FROM caleb_conversations c
+         WHERE c.owner_id = $1
+         ORDER BY c.updated_at DESC
+         LIMIT 200`,
+        [ownerId]
+    );
 
-    while (
-        conversation.messages.length > 0 &&
-        conversation.messages[conversation.messages.length - 1].role === "ai"
-    ) {
-        conversation.messages.pop();
-    }
-
-    const last = conversation.messages[conversation.messages.length - 1];
-
-    if (!last || last.role !== "user") {
-        return null;
-    }
-
-    conversation.updatedAt = now();
-    save(store);
-
-    return last.text;
+    return result.rows.map((row) => ({
+        ...toConversation(row),
+        messageCount: Number(row.message_count)
+    }));
 };
 
-const setFeedback = (conversationId, messageId, rating) => {
-    const store = load();
-    const conversation = findConversation(store, conversationId);
+const createConversation = async (ownerId, title = DEFAULT_TITLE) => {
+    const result = await query(
+        `INSERT INTO caleb_conversations (id, owner_id, title)
+         VALUES ($1, $2, $3)
+         RETURNING id, title, created_at, updated_at`,
+        [randomUUID(), ownerId, title]
+    );
 
-    if (!conversation) {
-        return null;
-    }
-
-    const message = conversation.messages.find((item) => item.id === messageId);
-
-    if (!message) {
-        return null;
-    }
-
-    message.feedback = rating;
-    save(store);
-
-    return message;
+    return { ...toConversation(result.rows[0]), messages: [] };
 };
 
-const getFacts = () => load().facts;
+const getConversation = async (ownerId, id) => {
+    if (!isUuid(id)) {
+        return null;
+    }
 
-const addFacts = (newFacts) => {
-    const store = load();
-    const known = new Set(store.facts.map((fact) => fact.text.toLowerCase()));
+    const found = await query(
+        `SELECT id, title, created_at, updated_at
+         FROM caleb_conversations
+         WHERE id = $1 AND owner_id = $2`,
+        [id, ownerId]
+    );
 
-    newFacts.forEach((text) => {
+    if (found.rows.length === 0) {
+        return null;
+    }
+
+    const messages = await query(
+        `SELECT id, role, text, feedback, sources, stopped, created_at
+         FROM caleb_messages
+         WHERE conversation_id = $1
+         ORDER BY seq`,
+        [id]
+    );
+
+    return {
+        ...toConversation(found.rows[0]),
+        messages: messages.rows.map(toMessage)
+    };
+};
+
+const renameConversation = async (ownerId, id, title) => {
+    if (!isUuid(id)) {
+        return null;
+    }
+
+    const result = await query(
+        `UPDATE caleb_conversations
+         SET title = $3
+         WHERE id = $1 AND owner_id = $2
+         RETURNING id, title, created_at, updated_at`,
+        [id, ownerId, title]
+    );
+
+    return result.rows.length > 0 ? toConversation(result.rows[0]) : null;
+};
+
+const deleteConversation = async (ownerId, id) => {
+    if (!isUuid(id)) {
+        return false;
+    }
+
+    const result = await query(
+        `DELETE FROM caleb_conversations
+         WHERE id = $1 AND owner_id = $2
+         RETURNING id`,
+        [id, ownerId]
+    );
+
+    return result.rows.length > 0;
+};
+
+const addMessage = async (ownerId, conversationId, role, text, extra = {}) => {
+    if (!isUuid(conversationId)) {
+        return null;
+    }
+
+    const touched = await query(
+        `UPDATE caleb_conversations
+         SET updated_at = now()
+         WHERE id = $1 AND owner_id = $2
+         RETURNING id`,
+        [conversationId, ownerId]
+    );
+
+    if (touched.rows.length === 0) {
+        return null;
+    }
+
+    const sources = role === "ai" ? JSON.stringify(extra.sources || []) : null;
+
+    const result = await query(
+        `INSERT INTO caleb_messages (id, conversation_id, role, text, sources, stopped)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+         RETURNING id, role, text, feedback, sources, stopped, created_at`,
+        [randomUUID(), conversationId, role, text, sources, Boolean(extra.stopped)]
+    );
+
+    return toMessage(result.rows[0]);
+};
+
+const prepareRegeneration = async (ownerId, conversationId) => {
+    if (!isUuid(conversationId)) {
+        return null;
+    }
+
+    const owned = await query(
+        `SELECT id FROM caleb_conversations WHERE id = $1 AND owner_id = $2`,
+        [conversationId, ownerId]
+    );
+
+    if (owned.rows.length === 0) {
+        return null;
+    }
+
+    await query(
+        `DELETE FROM caleb_messages
+         WHERE conversation_id = $1
+           AND seq > COALESCE(
+               (SELECT MAX(seq) FROM caleb_messages
+                WHERE conversation_id = $1 AND role = 'user'),
+               0
+           )`,
+        [conversationId]
+    );
+
+    const last = await query(
+        `SELECT role, text FROM caleb_messages
+         WHERE conversation_id = $1
+         ORDER BY seq DESC
+         LIMIT 1`,
+        [conversationId]
+    );
+
+    if (last.rows.length === 0 || last.rows[0].role !== "user") {
+        return null;
+    }
+
+    await query(
+        `UPDATE caleb_conversations SET updated_at = now() WHERE id = $1`,
+        [conversationId]
+    );
+
+    return last.rows[0].text;
+};
+
+const setFeedback = async (ownerId, conversationId, messageId, rating) => {
+    if (!isUuid(conversationId) || !isUuid(messageId)) {
+        return null;
+    }
+
+    const result = await query(
+        `UPDATE caleb_messages m
+         SET feedback = $3
+         FROM caleb_conversations c
+         WHERE m.id = $1
+           AND m.conversation_id = c.id
+           AND c.id = $2
+           AND c.owner_id = $4
+         RETURNING m.id`,
+        [messageId, conversationId, rating, ownerId]
+    );
+
+    return result.rows.length > 0 ? { id: messageId, feedback: rating } : null;
+};
+
+const getFacts = async (ownerId) => {
+    const result = await query(
+        `SELECT id, text, created_at
+         FROM caleb_facts
+         WHERE owner_id = $1
+         ORDER BY seq`,
+        [ownerId]
+    );
+
+    return result.rows.map(toFact);
+};
+
+const addFacts = async (ownerId, newFacts) => {
+    const existing = await getFacts(ownerId);
+    const known = new Set(existing.map((fact) => fact.text.toLowerCase()));
+    let count = existing.length;
+
+    for (const raw of newFacts) {
+        const text = String(raw || "").trim().slice(0, 200);
         const key = text.toLowerCase();
 
-        if (!known.has(key)) {
-            known.add(key);
-            store.facts.push({
-                id: randomUUID(),
-                text,
-                createdAt: now()
-            });
+        if (!text || known.has(key) || count >= FACT_LIMIT) {
+            continue;
         }
-    });
 
-    save(store);
+        known.add(key);
+        count += 1;
 
-    return store.facts;
+        await query(
+            `INSERT INTO caleb_facts (id, owner_id, text) VALUES ($1, $2, $3)`,
+            [randomUUID(), ownerId, text]
+        );
+    }
+
+    return getFacts(ownerId);
 };
 
-const deleteFact = (factId) => {
-    const store = load();
-    store.facts = store.facts.filter((fact) => fact.id !== factId);
-    save(store);
+const deleteFact = async (ownerId, factId) => {
+    if (!isUuid(factId)) {
+        return;
+    }
+
+    await query(
+        `DELETE FROM caleb_facts WHERE id = $1 AND owner_id = $2`,
+        [factId, ownerId]
+    );
 };
 
-const clearFacts = () => {
-    const store = load();
-    store.facts = [];
-    save(store);
+const clearFacts = async (ownerId) => {
+    await query(`DELETE FROM caleb_facts WHERE owner_id = $1`, [ownerId]);
 };
 
 module.exports = {
