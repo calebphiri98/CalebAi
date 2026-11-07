@@ -198,21 +198,53 @@ const formatMemory = (facts) => {
     ].join("\n");
 };
 
-const buildContents = (message, history) => {
-    const turns = [...history, { role: "user", text: message }].filter(
-        (turn) => turn.text && turn.text.trim()
+const imageParts = (images) =>
+    (images || []).map((image) => ({
+        inlineData: { mimeType: image.mimeType, data: image.data }
+    }));
+
+const documentParts = (documents) => {
+    const parts = [];
+
+    (documents || []).forEach((doc) => {
+        if (doc.data) {
+            parts.push({ text: `Attached PDF named "${doc.name}":` });
+            parts.push({ inlineData: { mimeType: doc.mimeType, data: doc.data } });
+        } else if (doc.text) {
+            const note = doc.truncated ? " (only the first part of this file is shown)" : "";
+            parts.push({
+                text: `Attached document named "${doc.name}"${note}:\n${doc.text}`
+            });
+        }
+    });
+
+    return parts;
+};
+
+const buildContents = (message, history, images = [], documents = []) => {
+    const turns = [...history, { role: "user", text: message, images, documents }].filter(
+        (turn) =>
+            (turn.text && turn.text.trim()) ||
+            (turn.images && turn.images.length > 0) ||
+            (turn.documents && turn.documents.length > 0)
     );
 
     const contents = [];
 
     turns.forEach((turn) => {
         const role = turn.role === "ai" ? "model" : "user";
+        const parts = [...imageParts(turn.images), ...documentParts(turn.documents)];
+
+        if (turn.text && turn.text.trim()) {
+            parts.push({ text: turn.text });
+        }
+
         const last = contents[contents.length - 1];
 
         if (last && last.role === role) {
-            last.parts[0].text += `\n\n${turn.text}`;
+            last.parts.push(...parts);
         } else {
-            contents.push({ role, parts: [{ text: turn.text }] });
+            contents.push({ role, parts });
         }
     });
 
@@ -222,7 +254,6 @@ const buildContents = (message, history) => {
 
     return contents;
 };
-
 const buildConfig = (model, systemInstruction, abortSignal, withTools) => {
     const config = { systemInstruction, abortSignal };
 
@@ -382,8 +413,15 @@ const runSearchCall = async (call, sourceMap) => {
     }
 };
 
-async function* streamAIResponse({ message, history = [], facts = [], signal }) {
-    const contents = buildContents(message, history);
+async function* streamAIResponse({
+    message,
+    images = [],
+    documents = [],
+    history = [],
+    facts = [],
+    signal
+}) {
+    const contents = buildContents(message, history, images, documents);
     const systemInstruction =
         BASE_SYSTEM_INSTRUCTION + TOOL_GUIDE + formatDate() + formatMemory(facts);
 
