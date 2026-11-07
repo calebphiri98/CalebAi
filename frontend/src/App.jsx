@@ -33,6 +33,160 @@ const SUGGESTIONS = [
 
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 days", "Older"];
 
+const MAX_IMAGES = 3;
+const MAX_DOCUMENTS = 2;
+const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024;
+const DOCUMENT_EXTENSIONS = ["pdf", "docx", "pptx", "xlsx", "txt", "md", "csv", "json"];
+const LEGACY_EXTENSIONS = ["doc", "ppt", "xls"];
+const MAX_IMAGE_CHARS = 1400000;
+const THUMB_SIDE = 256;
+const IMAGE_ATTEMPTS = [
+  [1024, 0.8],
+  [900, 0.7],
+  [768, 0.6],
+];
+
+const ImageIcon = ({ size = 20 }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>
+    <circle cx="9" cy="9" r="2"></circle>
+    <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"></path>
+  </svg>
+);
+const PaperclipIcon = ({ size = 20 }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+  </svg>
+);
+
+const formatSize = (bytes) => {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+};
+
+const readAsBase64 = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      resolve(result.slice(result.indexOf(",") + 1));
+    };
+
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+
+const DocumentChip = ({ doc, onRemove }) => (
+  <div className={`document-chip ${doc.kind}`} title={doc.name}>
+    <span className="document-badge">{doc.kind.toUpperCase()}</span>
+
+    <span className="document-meta">
+      <span className="document-name">{doc.name}</span>
+      <span className="document-size">
+        {formatSize(doc.size)}
+        {doc.truncated ? " · partly read" : ""}
+      </span>
+    </span>
+
+    {onRemove && (
+      <button className="document-remove" onClick={onRemove} title="Remove file">
+        <CloseIcon size={12} />
+      </button>
+    )}
+  </div>
+);
+
+const loadImage = async (file) => {
+  if (window.createImageBitmap) {
+    try {
+      return await createImageBitmap(file);
+    } catch (error) {
+      console.error("Bitmap error:", error);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Unsupported image"));
+    };
+
+    image.src = url;
+  });
+};
+
+const drawScaled = (source, maxSide, quality) => {
+  const scale = Math.min(1, maxSide / Math.max(source.width, source.height));
+  const canvas = document.createElement("canvas");
+
+  canvas.width = Math.max(1, Math.round(source.width * scale));
+  canvas.height = Math.max(1, Math.round(source.height * scale));
+
+  const context = canvas.getContext("2d");
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+
+  return canvas.toDataURL("image/jpeg", quality);
+};
+
+const prepareImage = async (file) => {
+  const source = await loadImage(file);
+
+  try {
+    let data = "";
+
+    for (const [side, quality] of IMAGE_ATTEMPTS) {
+      const url = drawScaled(source, side, quality);
+      data = url.slice(url.indexOf(",") + 1);
+
+      if (data.length <= MAX_IMAGE_CHARS) break;
+    }
+
+    if (data.length > MAX_IMAGE_CHARS) {
+      throw new Error("Image is too large");
+    }
+
+    return {
+      id: `img-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      mimeType: "image/jpeg",
+      data,
+      thumb: drawScaled(source, THUMB_SIDE, 0.7),
+    };
+  } finally {
+    if (source.close) source.close();
+  }
+};
+
 const groupLabel = (iso) => {
   const startOfToday = new Date().setHours(0, 0, 0, 0);
   const days = Math.round(
@@ -90,6 +244,11 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [facts, setFacts] = useState([]);
   const [input, setInput] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [documents, setDocuments] = useState([]);
+  const [dragging, setDragging] = useState(false);
+  const documentInputRef = useRef(null);
+  const [processing, setProcessing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
   const [listening, setListening] = useState(false);
@@ -105,6 +264,7 @@ function App() {
   const messagesRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
   const recognitionRef = useRef(null);
   const baseTextRef = useRef("");
   const abortRef = useRef(null);
@@ -227,6 +387,149 @@ function App() {
     setSpeakingId(null);
   };
 
+  const addImages = async (fileList) => {
+    const files = Array.from(fileList || []).filter((file) =>
+      file.type.startsWith("image/")
+    );
+
+    if (files.length === 0) {
+      showNotice("Choose an image file.");
+      return;
+    }
+
+    const room = MAX_IMAGES - attachments.length;
+
+    if (room <= 0) {
+      showNotice(`You can attach up to ${MAX_IMAGES} images.`);
+      return;
+    }
+
+    if (files.length > room) {
+      showNotice(`Only ${room} more image${room === 1 ? "" : "s"} can be added.`);
+    }
+
+    setProcessing(true);
+
+    const prepared = [];
+
+    for (const file of files.slice(0, room)) {
+      try {
+        prepared.push(await prepareImage(file));
+      } catch (error) {
+        console.error("Image error:", error);
+        showNotice("Could not read that image. Try a JPG or PNG.");
+      }
+    }
+
+    setAttachments((previous) => [...previous, ...prepared].slice(0, MAX_IMAGES));
+    setProcessing(false);
+  };
+
+  const addDocuments = async (fileList) => {
+    const files = Array.from(fileList || []);
+
+    if (files.length === 0) return;
+
+    const room = MAX_DOCUMENTS - documents.length;
+
+    if (room <= 0) {
+      showNotice(`You can attach up to ${MAX_DOCUMENTS} documents.`);
+      return;
+    }
+
+    if (files.length > room) {
+      showNotice(`Only ${room} more document${room === 1 ? "" : "s"} can be added.`);
+    }
+
+    const prepared = [];
+
+    for (const file of files.slice(0, room)) {
+      const extension = (file.name.split(".").pop() || "").toLowerCase();
+
+      if (LEGACY_EXTENSIONS.includes(extension)) {
+        showNotice(`"${file.name}" is an old Office format. Save it as PDF or DOCX first.`);
+        continue;
+      }
+
+      if (!DOCUMENT_EXTENSIONS.includes(extension)) {
+        showNotice(`"${file.name}" is not supported. Use PDF, DOCX, PPTX, XLSX, TXT, MD, CSV or JSON.`);
+        continue;
+      }
+
+      if (file.size === 0) {
+        showNotice(`"${file.name}" is empty.`);
+        continue;
+      }
+
+      if (file.size > MAX_DOCUMENT_BYTES) {
+        showNotice(`"${file.name}" is larger than 4 MB.`);
+        continue;
+      }
+
+      try {
+        prepared.push({
+          id: `doc-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          name: file.name,
+          kind: extension,
+          size: file.size,
+          data: await readAsBase64(file),
+        });
+      } catch (error) {
+        console.error("Document error:", error);
+        showNotice(`Could not read "${file.name}".`);
+      }
+    }
+
+    if (prepared.length > 0) {
+      setDocuments((previous) => [...previous, ...prepared].slice(0, MAX_DOCUMENTS));
+    }
+  };
+
+  const removeDocument = (id) => {
+    setDocuments((previous) => previous.filter((item) => item.id !== id));
+  };
+
+  const addFiles = (fileList) => {
+    const all = Array.from(fileList || []);
+    const pictures = all.filter((file) => file.type.startsWith("image/"));
+    const others = all.filter((file) => !file.type.startsWith("image/"));
+
+    if (pictures.length > 0) addImages(pictures);
+    if (others.length > 0) addDocuments(others);
+  };
+
+  const handleDragOver = (event) => {
+    if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes("Files")) {
+      event.preventDefault();
+      setDragging(true);
+    }
+  };
+
+  const handleDragLeave = (event) => {
+    if (!event.currentTarget.contains(event.relatedTarget)) {
+      setDragging(false);
+    }
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setDragging(false);
+    addFiles(event.dataTransfer.files);
+  };
+
+  const removeAttachment = (id) => {
+    setAttachments((previous) => previous.filter((item) => item.id !== id));
+  };
+
+  const handlePaste = (event) => {
+    const files = Array.from(event.clipboardData?.files || []);
+
+    if (files.length > 0) {
+      event.preventDefault();
+      addFiles(files);
+    }
+  };
+
   const startListening = () => {
     if (!SpeechRecognition) {
       showNotice("Voice input is not supported in this browser. Use Chrome or Edge.");
@@ -273,7 +576,7 @@ function App() {
     setListening(false);
   };
 
-  const streamReply = async ({ text, regenerate = false }) => {
+  const streamReply = async ({ text, images = [], documents = [], regenerate = false }) => {
     const controller = new AbortController();
     const stamp = Date.now();
     const draftId = `draft-${stamp}`;
@@ -294,6 +597,13 @@ function App() {
           id: localUserId,
           role: "user",
           text,
+          images: images.map((image) => ({ id: image.id, thumb: image.thumb })),
+          documents: documents.map((doc) => ({
+            id: doc.id,
+            name: doc.name,
+            kind: doc.kind,
+            size: doc.size,
+          })),
           feedback: null,
           local: true,
         });
@@ -321,7 +631,17 @@ function App() {
 
     try {
       await streamChat({
-        body: { conversationId, message: text, regenerate },
+        body: {
+          conversationId,
+          message: text,
+          regenerate,
+          images: regenerate
+            ? []
+            : images.map(({ mimeType, data, thumb }) => ({ mimeType, data, thumb })),
+          documents: regenerate
+            ? []
+            : documents.map(({ name, data }) => ({ name, data })),
+        },
         signal: controller.signal,
         onEvent: (event) => {
           if (event.type === "meta") {
@@ -410,12 +730,17 @@ function App() {
   const sendMessage = () => {
     const text = input.trim();
 
-    if (!text || loading) return;
+    if ((!text && attachments.length === 0 && documents.length === 0) || loading || processing) return;
 
     if (listening) stopListening();
 
+    const images = attachments;
+    const docs = documents;
+
     setInput("");
-    streamReply({ text });
+    setAttachments([]);
+    setDocuments([]);
+    streamReply({ text, images, documents: docs });
   };
 
   const regenerate = () => {
@@ -511,6 +836,8 @@ function App() {
     stopSpeaking();
     setActiveId(null);
     setMessages([]);
+    setAttachments([]);
+    setDocuments([]);
     stickRef.current = true;
     textareaRef.current?.focus();
     closeSidebarOnMobile();
@@ -636,6 +963,8 @@ function App() {
   const activeTitle =
     conversations.find((item) => item.id === activeId)?.title || "New chat";
 
+  const canSend = !loading && !processing && (input.trim() || attachments.length > 0 || documents.length > 0);
+
   return (
     <div className="app">
       {sidebarOpen && (
@@ -746,7 +1075,8 @@ function App() {
                 <h2>Hello, I am Caleb AI</h2>
                 <p>
                   Ask me about your studies, code, writing, plans or what is
-                  happening in the world today. Type or tap the mic to talk.
+                  happening in the world today. Type, tap the mic to talk, or
+                  attach an image for me to look at.
                 </p>
 
                 <div className="suggestions">
@@ -779,7 +1109,25 @@ function App() {
                           </div>
                         )
                       ) : (
-                        <span className="plain-text">{item.text}</span>
+                        <>
+                          {item.images && item.images.length > 0 && (
+                            <div className="message-images">
+                              {item.images.map((image) => (
+                                <img key={image.id} src={image.thumb} alt="Attached" />
+                              ))}
+                            </div>
+                          )}
+
+                          {item.documents && item.documents.length > 0 && (
+                            <div className="message-documents">
+                              {item.documents.map((doc) => (
+                                <DocumentChip key={doc.id} doc={doc} />
+                              ))}
+                            </div>
+                          )}
+
+                          {item.text && <span className="plain-text">{item.text}</span>}
+                        </>
                       )}
                     </div>
 
@@ -853,7 +1201,38 @@ function App() {
 
         {notice && <div className="notice">{notice}</div>}
 
-        <div className="composer">
+        <div
+          className={`composer ${dragging ? "dragging" : ""}`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {(attachments.length > 0 || documents.length > 0 || processing) && (
+            <div className="attachments">
+              {attachments.map((attachment) => (
+                <div key={attachment.id} className="attachment">
+                  <img src={attachment.thumb} alt="Attachment preview" />
+                  <button
+                    onClick={() => removeAttachment(attachment.id)}
+                    title="Remove image"
+                  >
+                    <CloseIcon size={12} />
+                  </button>
+                </div>
+              ))}
+
+              {documents.map((doc) => (
+                <DocumentChip
+                  key={doc.id}
+                  doc={doc}
+                  onRemove={() => removeDocument(doc.id)}
+                />
+              ))}
+
+              {processing && <div className="attachment processing"><span className="attachment-spinner"></span></div>}
+            </div>
+          )}
+
           <div className="composer-box">
             <button
               className={`icon-button mic ${listening ? "listening" : ""}`}
@@ -862,6 +1241,48 @@ function App() {
             >
               <MicIcon />
             </button>
+
+            <button
+              className="icon-button attach"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={attachments.length >= MAX_IMAGES}
+              title="Attach an image"
+            >
+              <ImageIcon />
+            </button>
+
+            <button
+              className="icon-button attach"
+              onClick={() => documentInputRef.current?.click()}
+              disabled={documents.length >= MAX_DOCUMENTS}
+              title="Attach a document"
+            >
+              <PaperclipIcon />
+            </button>
+
+            <input
+              ref={documentInputRef}
+              type="file"
+              accept=".pdf,.docx,.pptx,.xlsx,.txt,.md,.csv,.json"
+              multiple
+              hidden
+              onChange={(event) => {
+                addDocuments(event.target.files);
+                event.target.value = "";
+              }}
+            />
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+              onChange={(event) => {
+                addImages(event.target.files);
+                event.target.value = "";
+              }}
+            />
 
             <textarea
               ref={textareaRef}
@@ -875,6 +1296,7 @@ function App() {
               }
               value={input}
               onChange={(event) => setInput(event.target.value)}
+              onPaste={handlePaste}
               onKeyDown={(event) => {
                 if (
                   event.key === "Enter" &&
@@ -900,7 +1322,7 @@ function App() {
             <button
               className="icon-button send"
               onClick={sendMessage}
-              disabled={loading || !input.trim()}
+              disabled={!canSend}
               title={loading ? "Wait for the reply to finish" : "Send"}
             >
               <SendIcon />
