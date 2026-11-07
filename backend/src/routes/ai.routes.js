@@ -1,4 +1,5 @@
 const express = require("express");
+const { requireClient } = require("../middleware/client.js");
 const {
     streamChat,
     listConversations,
@@ -14,6 +15,8 @@ const {
 } = require("../controllers/ai.controller.js");
 
 const router = express.Router();
+
+router.use(requireClient);
 
 router.post("/chat/stream", streamChat);
 
