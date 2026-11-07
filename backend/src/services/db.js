@@ -49,6 +49,30 @@ CREATE TABLE IF NOT EXISTS caleb_facts (
 );
 CREATE INDEX IF NOT EXISTS caleb_facts_owner_idx
     ON caleb_facts (owner_id, seq);
+CREATE TABLE IF NOT EXISTS caleb_message_images (
+    id UUID PRIMARY KEY,
+    message_id UUID NOT NULL REFERENCES caleb_messages(id) ON DELETE CASCADE,
+    mime_type TEXT NOT NULL,
+    data BYTEA NOT NULL,
+    thumb TEXT NOT NULL,
+    position INT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS caleb_message_images_message_idx
+    ON caleb_message_images (message_id, position);
+CREATE TABLE IF NOT EXISTS caleb_message_documents (
+    id UUID PRIMARY KEY,
+    message_id UUID NOT NULL REFERENCES caleb_messages(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INT NOT NULL,
+    data BYTEA,
+    content TEXT,
+    truncated BOOLEAN NOT NULL DEFAULT false,
+    position INT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS caleb_message_documents_message_idx
+    ON caleb_message_documents (message_id, position);
 `;
 
 let schemaReady = null;
