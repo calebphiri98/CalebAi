@@ -4,9 +4,15 @@ const {
     generateTitle
 } = require("../services/ai.service.js");
 const memory = require("../services/memory.service.js");
+const { cleanDocuments } = require("../services/documents.service.js");
 
 const HISTORY_LIMIT = 10;
 const MAX_MESSAGE_CHARS = 8000;
+const MAX_IMAGES = 3;
+const MAX_IMAGE_CHARS = 1500000;
+const MAX_THUMB_CHARS = 80000;
+const THUMB_PREFIX = "data:image/jpeg;base64,";
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const sendEvent = (res, payload) => {
     if (res.writableEnded || res.destroyed) {
@@ -31,12 +37,86 @@ const safe = (handler) => async (req, res) => {
     }
 };
 
+const cleanImages = (raw) => {
+    if (raw === undefined || raw === null) {
+        return [];
+    }
+
+    if (!Array.isArray(raw) || raw.length > MAX_IMAGES) {
+        return null;
+    }
+
+    const cleaned = [];
+
+    for (const item of raw) {
+        if (
+            !item ||
+            item.mimeType !== "image/jpeg" ||
+            typeof item.data !== "string" ||
+            typeof item.thumb !== "string"
+        ) {
+            return null;
+        }
+
+        if (
+            item.data.length === 0 ||
+            item.data.length > MAX_IMAGE_CHARS ||
+            !BASE64_PATTERN.test(item.data)
+        ) {
+            return null;
+        }
+
+        if (
+            !item.thumb.startsWith(THUMB_PREFIX) ||
+            item.thumb.length > MAX_THUMB_CHARS ||
+            !BASE64_PATTERN.test(item.thumb.slice(THUMB_PREFIX.length))
+        ) {
+            return null;
+        }
+
+        const head = Buffer.from(item.data.slice(0, 8), "base64");
+
+        if (head[0] !== 0xff || head[1] !== 0xd8) {
+            return null;
+        }
+
+        cleaned.push({
+            mimeType: "image/jpeg",
+            data: item.data,
+            thumb: item.thumb
+        });
+    }
+
+    return cleaned;
+};
+
 const streamChat = async (req, res) => {
     try {
         const ownerId = req.ownerId;
         const text = String(req.body.message || "").trim();
         const regenerate = Boolean(req.body.regenerate);
         const requestedId = req.body.conversationId || null;
+        const images = regenerate ? [] : cleanImages(req.body.images);
+
+        if (images === null) {
+            return res.status(400).json({
+                success: false,
+                message: "One of the images could not be accepted. Try a smaller image."
+            });
+        }
+
+        const cleanedDocuments = regenerate
+            ? { ok: true, documents: [] }
+            : await cleanDocuments(req.body.documents);
+
+        if (!cleanedDocuments.ok) {
+            return res.status(400).json({
+                success: false,
+                message: cleanedDocuments.message
+            });
+        }
+
+        const documents = cleanedDocuments.documents;
 
         let conversation = requestedId
             ? await memory.getConversation(ownerId, requestedId)
@@ -49,7 +129,7 @@ const streamChat = async (req, res) => {
             });
         }
 
-        if (!regenerate && !text) {
+        if (!regenerate && !text && images.length === 0 && documents.length === 0) {
             return res.status(400).json({
                 success: false,
                 message: "Message is required"
@@ -71,17 +151,23 @@ const streamChat = async (req, res) => {
         }
 
         let prompt = text;
+        let promptImages = images;
+        let promptDocuments = documents;
         let userMessage = null;
 
         if (regenerate) {
-            prompt = await memory.prepareRegeneration(ownerId, conversation.id);
+            const prepared = await memory.prepareRegeneration(ownerId, conversation.id);
 
-            if (!prompt) {
+            if (!prepared) {
                 return res.status(400).json({
                     success: false,
                     message: "Nothing to regenerate"
                 });
             }
+
+            prompt = prepared.text;
+            promptImages = prepared.images;
+            promptDocuments = prepared.documents;
         } else {
             if (!conversation) {
                 conversation = await memory.createConversation(ownerId);
@@ -91,19 +177,15 @@ const streamChat = async (req, res) => {
                 ownerId,
                 conversation.id,
                 "user",
-                text
+                text,
+                { images, documents }
             );
         }
 
         const conversationId = conversation.id;
         const needsTitle = !regenerate && conversation.title === memory.DEFAULT_TITLE;
 
-        const saved = await memory.getConversation(ownerId, conversationId);
-
-        const history = saved.messages
-            .slice(0, -1)
-            .slice(-HISTORY_LIMIT)
-            .map(({ role, text: messageText }) => ({ role, text: messageText }));
+        const history = await memory.getHistory(ownerId, conversationId, HISTORY_LIMIT);
 
         const facts = (await memory.getFacts(ownerId)).map((fact) => fact.text);
 
@@ -133,6 +215,8 @@ const streamChat = async (req, res) => {
         try {
             for await (const event of streamAIResponse({
                 message: prompt,
+                images: promptImages,
+                documents: promptDocuments,
                 history,
                 facts,
                 signal: controller.signal
@@ -185,10 +269,17 @@ const streamChat = async (req, res) => {
         res.end();
 
         if (needsTitle) {
-            const fallback = text.length > 40 ? `${text.slice(0, 40).trim()}...` : text;
+            const fallback = text
+                ? text.length > 40
+                    ? `${text.slice(0, 40).trim()}...`
+                    : text
+                : documents.length > 0
+                    ? documents[0].name.slice(0, 40)
+                    : "Image question";
+
             await memory.renameConversation(ownerId, conversationId, fallback);
 
-            if (aiMessage && !failed) {
+            if (aiMessage && !failed && text) {
                 generateTitle(text, reply)
                     .then(async (title) => {
                         if (title) {
@@ -199,7 +290,7 @@ const streamChat = async (req, res) => {
             }
         }
 
-        if (!regenerate && !failed) {
+        if (!regenerate && !failed && text) {
             extractFacts(text, facts)
                 .then(async (newFacts) => {
                     if (newFacts.length > 0) {
