@@ -3,6 +3,8 @@ const { query } = require("./db.js");
 
 const DEFAULT_TITLE = "New chat";
 const FACT_LIMIT = 100;
+const HISTORY_IMAGE_CAP = 4;
+const HISTORY_DOCUMENT_CAP = 2;
 const UUID_PATTERN =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -15,7 +17,7 @@ const toConversation = (row) => ({
     updatedAt: row.updated_at.toISOString()
 });
 
-const toMessage = (row) => {
+const toMessage = (row, images = [], documents = []) => {
     const message = {
         id: row.id,
         role: row.role,
@@ -23,6 +25,11 @@ const toMessage = (row) => {
         feedback: row.feedback,
         createdAt: row.created_at.toISOString()
     };
+
+    if (row.role === "user") {
+        message.images = images;
+        message.documents = documents;
+    }
 
     if (row.role === "ai") {
         message.sources = row.sources || [];
@@ -37,6 +44,114 @@ const toFact = (row) => ({
     text: row.text,
     createdAt: row.created_at.toISOString()
 });
+
+const loadThumbs = async (messageIds) => {
+    const map = new Map();
+
+    if (messageIds.length === 0) {
+        return map;
+    }
+
+    const result = await query(
+        `SELECT id, message_id, thumb
+         FROM caleb_message_images
+         WHERE message_id = ANY($1::uuid[])
+         ORDER BY message_id, position`,
+        [messageIds]
+    );
+
+    result.rows.forEach((row) => {
+        const list = map.get(row.message_id) || [];
+        list.push({ id: row.id, thumb: row.thumb });
+        map.set(row.message_id, list);
+    });
+
+    return map;
+};
+
+const loadFullImages = async (messageIds) => {
+    const map = new Map();
+
+    if (messageIds.length === 0) {
+        return map;
+    }
+
+    const result = await query(
+        `SELECT message_id, mime_type, data
+         FROM caleb_message_images
+         WHERE message_id = ANY($1::uuid[])
+         ORDER BY message_id, position`,
+        [messageIds]
+    );
+
+    result.rows.forEach((row) => {
+        const list = map.get(row.message_id) || [];
+        list.push({ mimeType: row.mime_type, data: row.data.toString("base64") });
+        map.set(row.message_id, list);
+    });
+
+    return map;
+};
+
+const loadDocumentChips = async (messageIds) => {
+    const map = new Map();
+
+    if (messageIds.length === 0) {
+        return map;
+    }
+
+    const result = await query(
+        `SELECT id, message_id, name, kind, size, truncated
+         FROM caleb_message_documents
+         WHERE message_id = ANY($1::uuid[])
+         ORDER BY message_id, position`,
+        [messageIds]
+    );
+
+    result.rows.forEach((row) => {
+        const list = map.get(row.message_id) || [];
+        list.push({
+            id: row.id,
+            name: row.name,
+            kind: row.kind,
+            size: row.size,
+            truncated: row.truncated
+        });
+        map.set(row.message_id, list);
+    });
+
+    return map;
+};
+
+const loadFullDocuments = async (messageIds) => {
+    const map = new Map();
+
+    if (messageIds.length === 0) {
+        return map;
+    }
+
+    const result = await query(
+        `SELECT message_id, name, mime_type, data, content, truncated
+         FROM caleb_message_documents
+         WHERE message_id = ANY($1::uuid[])
+         ORDER BY message_id, position`,
+        [messageIds]
+    );
+
+    result.rows.forEach((row) => {
+        const list = map.get(row.message_id) || [];
+        list.push({
+            name: row.name,
+            mimeType: row.mime_type,
+            data: row.data ? row.data.toString("base64") : null,
+            text: row.content,
+            truncated: row.truncated
+        });
+        map.set(row.message_id, list);
+    });
+
+    return map;
+};
 
 const listConversations = async (ownerId) => {
     const result = await query(
@@ -90,10 +205,110 @@ const getConversation = async (ownerId, id) => {
         [id]
     );
 
+    const userIds = messages.rows.filter((row) => row.role === "user").map((row) => row.id);
+
+    const thumbs = await loadThumbs(userIds);
+    const chips = await loadDocumentChips(userIds);
+
     return {
         ...toConversation(found.rows[0]),
-        messages: messages.rows.map(toMessage)
+        messages: messages.rows.map((row) =>
+            toMessage(row, thumbs.get(row.id) || [], chips.get(row.id) || [])
+        )
     };
+};
+
+const getHistory = async (ownerId, conversationId, limit) => {
+    if (!isUuid(conversationId)) {
+        return [];
+    }
+
+    const result = await query(
+        `SELECT m.id, m.role, m.text
+         FROM caleb_messages m
+         JOIN caleb_conversations c ON c.id = m.conversation_id
+         WHERE m.conversation_id = $1 AND c.owner_id = $2
+         ORDER BY m.seq DESC
+         LIMIT $3`,
+        [conversationId, ownerId, limit + 1]
+    );
+
+    const rows = result.rows.slice(1).reverse();
+    const userIds = rows.filter((row) => row.role === "user").map((row) => row.id);
+
+    const counts = new Map();
+
+    if (userIds.length > 0) {
+        const counted = await query(
+            `SELECT message_id, COUNT(*)::int AS total
+             FROM caleb_message_images
+             WHERE message_id = ANY($1::uuid[])
+             GROUP BY message_id`,
+            [userIds]
+        );
+
+        counted.rows.forEach((row) => counts.set(row.message_id, row.total));
+    }
+
+    const chosen = [];
+    let used = 0;
+
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+        const total = counts.get(rows[index].id) || 0;
+
+        if (total > 0 && used + total <= HISTORY_IMAGE_CAP) {
+            chosen.push(rows[index].id);
+            used += total;
+        }
+    }
+
+    const images = await loadFullImages(chosen);
+
+    const docCounts = new Map();
+
+    if (userIds.length > 0) {
+        const countedDocs = await query(
+            `SELECT message_id, COUNT(*)::int AS total
+             FROM caleb_message_documents
+             WHERE message_id = ANY($1::uuid[])
+             GROUP BY message_id`,
+            [userIds]
+        );
+
+        countedDocs.rows.forEach((row) => docCounts.set(row.message_id, row.total));
+    }
+
+    const chosenDocs = [];
+    let usedDocs = 0;
+
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+        const total = docCounts.get(rows[index].id) || 0;
+
+        if (total > 0 && usedDocs + total <= HISTORY_DOCUMENT_CAP) {
+            chosenDocs.push(rows[index].id);
+            usedDocs += total;
+        }
+    }
+
+    const documents = await loadFullDocuments(chosenDocs);
+
+    return rows.map((row) => {
+        const attached = images.get(row.id) || [];
+        const attachedDocs = documents.get(row.id) || [];
+        const hadImages = (counts.get(row.id) || 0) > 0;
+        const hadDocs = (docCounts.get(row.id) || 0) > 0;
+        let text = row.text;
+
+        if (!text && hadImages && attached.length === 0) {
+            text = "[An earlier image is no longer shown]";
+        }
+
+        if (hadDocs && attachedDocs.length === 0) {
+            text = `${text ? `${text}\n` : ""}[An earlier document is no longer shown]`;
+        }
+
+        return { role: row.role, text, images: attached, documents: attachedDocs };
+    });
 };
 
 const renameConversation = async (ownerId, id, title) => {
@@ -153,7 +368,67 @@ const addMessage = async (ownerId, conversationId, role, text, extra = {}) => {
         [randomUUID(), conversationId, role, text, sources, Boolean(extra.stopped)]
     );
 
-    return toMessage(result.rows[0]);
+    const row = result.rows[0];
+    const stored = [];
+
+    if (role === "user" && Array.isArray(extra.images)) {
+        for (let index = 0; index < extra.images.length; index += 1) {
+            const image = extra.images[index];
+            const imageId = randomUUID();
+
+            await query(
+                `INSERT INTO caleb_message_images (id, message_id, mime_type, data, thumb, position)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [
+                    imageId,
+                    row.id,
+                    image.mimeType,
+                    Buffer.from(image.data, "base64"),
+                    image.thumb,
+                    index
+                ]
+            );
+
+            stored.push({ id: imageId, thumb: image.thumb });
+        }
+    }
+
+    const storedDocs = [];
+
+    if (role === "user" && Array.isArray(extra.documents)) {
+        for (let index = 0; index < extra.documents.length; index += 1) {
+            const doc = extra.documents[index];
+            const docId = randomUUID();
+
+            await query(
+                `INSERT INTO caleb_message_documents
+                    (id, message_id, name, kind, mime_type, size, data, content, truncated, position)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [
+                    docId,
+                    row.id,
+                    doc.name,
+                    doc.extension,
+                    doc.mimeType,
+                    doc.size,
+                    doc.data ? Buffer.from(doc.data, "base64") : null,
+                    doc.text,
+                    Boolean(doc.truncated),
+                    index
+                ]
+            );
+
+            storedDocs.push({
+                id: docId,
+                name: doc.name,
+                kind: doc.extension,
+                size: doc.size,
+                truncated: Boolean(doc.truncated)
+            });
+        }
+    }
+
+    return toMessage(row, stored, storedDocs);
 };
 
 const prepareRegeneration = async (ownerId, conversationId) => {
@@ -182,7 +457,7 @@ const prepareRegeneration = async (ownerId, conversationId) => {
     );
 
     const last = await query(
-        `SELECT role, text FROM caleb_messages
+        `SELECT id, role, text FROM caleb_messages
          WHERE conversation_id = $1
          ORDER BY seq DESC
          LIMIT 1`,
@@ -198,7 +473,14 @@ const prepareRegeneration = async (ownerId, conversationId) => {
         [conversationId]
     );
 
-    return last.rows[0].text;
+    const images = await loadFullImages([last.rows[0].id]);
+    const documents = await loadFullDocuments([last.rows[0].id]);
+
+    return {
+        text: last.rows[0].text,
+        images: images.get(last.rows[0].id) || [],
+        documents: documents.get(last.rows[0].id) || []
+    };
 };
 
 const setFeedback = async (ownerId, conversationId, messageId, rating) => {
@@ -278,6 +560,7 @@ module.exports = {
     listConversations,
     createConversation,
     getConversation,
+    getHistory,
     renameConversation,
     deleteConversation,
     addMessage,
