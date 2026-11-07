@@ -6,6 +6,7 @@ const {
 const memory = require("../services/memory.service.js");
 
 const HISTORY_LIMIT = 10;
+const MAX_MESSAGE_CHARS = 8000;
 
 const sendEvent = (res, payload) => {
     if (res.writableEnded || res.destroyed) {
@@ -15,13 +16,31 @@ const sendEvent = (res, payload) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
 };
 
+const safe = (handler) => async (req, res) => {
+    try {
+        await handler(req, res);
+    } catch (error) {
+        console.error("Request error:", error.message);
+
+        if (!res.headersSent) {
+            res.status(500).json({
+                success: false,
+                message: "Something went wrong. Please try again."
+            });
+        }
+    }
+};
+
 const streamChat = async (req, res) => {
     try {
-        const text = (req.body.message || "").trim();
+        const ownerId = req.ownerId;
+        const text = String(req.body.message || "").trim();
         const regenerate = Boolean(req.body.regenerate);
         const requestedId = req.body.conversationId || null;
 
-        let conversation = requestedId ? memory.getConversation(requestedId) : null;
+        let conversation = requestedId
+            ? await memory.getConversation(ownerId, requestedId)
+            : null;
 
         if (requestedId && !conversation) {
             return res.status(404).json({
@@ -37,6 +56,13 @@ const streamChat = async (req, res) => {
             });
         }
 
+        if (text.length > MAX_MESSAGE_CHARS) {
+            return res.status(400).json({
+                success: false,
+                message: `Message is too long. The limit is ${MAX_MESSAGE_CHARS} characters.`
+            });
+        }
+
         if (regenerate && !conversation) {
             return res.status(400).json({
                 success: false,
@@ -48,7 +74,7 @@ const streamChat = async (req, res) => {
         let userMessage = null;
 
         if (regenerate) {
-            prompt = memory.prepareRegeneration(conversation.id);
+            prompt = await memory.prepareRegeneration(ownerId, conversation.id);
 
             if (!prompt) {
                 return res.status(400).json({
@@ -58,23 +84,28 @@ const streamChat = async (req, res) => {
             }
         } else {
             if (!conversation) {
-                conversation = memory.createConversation();
+                conversation = await memory.createConversation(ownerId);
             }
 
-            userMessage = memory.addMessage(conversation.id, "user", text);
+            userMessage = await memory.addMessage(
+                ownerId,
+                conversation.id,
+                "user",
+                text
+            );
         }
 
         const conversationId = conversation.id;
         const needsTitle = !regenerate && conversation.title === memory.DEFAULT_TITLE;
 
-        const saved = memory.getConversation(conversationId);
+        const saved = await memory.getConversation(ownerId, conversationId);
 
         const history = saved.messages
             .slice(0, -1)
             .slice(-HISTORY_LIMIT)
             .map(({ role, text: messageText }) => ({ role, text: messageText }));
 
-        const facts = memory.getFacts().map((fact) => fact.text);
+        const facts = (await memory.getFacts(ownerId)).map((fact) => fact.text);
 
         res.writeHead(200, {
             "Content-Type": "text/event-stream; charset=utf-8",
@@ -119,12 +150,17 @@ const streamChat = async (req, res) => {
         } catch (error) {
             if (!controller.signal.aborted) {
                 failed = true;
-                console.error("AI Error:", error);
+                console.error("AI Error:", error.status || "", String(error.message).slice(0, 160));
 
-                sendEvent(res, {
-                    type: "error",
-                    message: "Failed to generate AI response"
-                });
+                let friendly = "Failed to generate AI response";
+
+                if (error.status === 429) {
+                    friendly = "Caleb AI is getting a lot of requests right now. Please try again in a minute.";
+                } else if (error.status === 503) {
+                    friendly = "Caleb AI is very busy right now. Please try again in a moment.";
+                }
+
+                sendEvent(res, { type: "error", message: friendly });
             }
         }
 
@@ -132,10 +168,17 @@ const streamChat = async (req, res) => {
         let aiMessage = null;
 
         if (reply.trim()) {
-            aiMessage = memory.addMessage(conversationId, "ai", reply, {
-                sources,
-                stopped
-            });
+            try {
+                aiMessage = await memory.addMessage(
+                    ownerId,
+                    conversationId,
+                    "ai",
+                    reply,
+                    { sources, stopped }
+                );
+            } catch (error) {
+                console.error("Save reply error:", error.message);
+            }
         }
 
         sendEvent(res, { type: "done", message: aiMessage });
@@ -143,13 +186,13 @@ const streamChat = async (req, res) => {
 
         if (needsTitle) {
             const fallback = text.length > 40 ? `${text.slice(0, 40).trim()}...` : text;
-            memory.renameConversation(conversationId, fallback);
+            await memory.renameConversation(ownerId, conversationId, fallback);
 
             if (aiMessage && !failed) {
                 generateTitle(text, reply)
-                    .then((title) => {
+                    .then(async (title) => {
                         if (title) {
-                            memory.renameConversation(conversationId, title);
+                            await memory.renameConversation(ownerId, conversationId, title);
                         }
                     })
                     .catch((error) => console.error("Title error:", error));
@@ -158,9 +201,9 @@ const streamChat = async (req, res) => {
 
         if (!regenerate && !failed) {
             extractFacts(text, facts)
-                .then((newFacts) => {
+                .then(async (newFacts) => {
                     if (newFacts.length > 0) {
-                        memory.addFacts(newFacts);
+                        await memory.addFacts(ownerId, newFacts);
                     }
                 })
                 .catch((error) => console.error("Memory error:", error));
@@ -179,22 +222,22 @@ const streamChat = async (req, res) => {
     }
 };
 
-const listConversations = (req, res) => {
+const listConversations = async (req, res) => {
     res.json({
         success: true,
-        conversations: memory.listConversations()
+        conversations: await memory.listConversations(req.ownerId)
     });
 };
 
-const createConversation = (req, res) => {
+const createConversation = async (req, res) => {
     res.json({
         success: true,
-        conversation: memory.createConversation()
+        conversation: await memory.createConversation(req.ownerId)
     });
 };
 
-const getConversation = (req, res) => {
-    const conversation = memory.getConversation(req.params.id);
+const getConversation = async (req, res) => {
+    const conversation = await memory.getConversation(req.ownerId, req.params.id);
 
     if (!conversation) {
         return res.status(404).json({
@@ -206,7 +249,7 @@ const getConversation = (req, res) => {
     res.json({ success: true, conversation });
 };
 
-const renameConversation = (req, res) => {
+const renameConversation = async (req, res) => {
     const title = String(req.body.title || "").trim().slice(0, 80);
 
     if (!title) {
@@ -216,7 +259,7 @@ const renameConversation = (req, res) => {
         });
     }
 
-    const updated = memory.renameConversation(req.params.id, title);
+    const updated = await memory.renameConversation(req.ownerId, req.params.id, title);
 
     if (!updated) {
         return res.status(404).json({
@@ -228,8 +271,8 @@ const renameConversation = (req, res) => {
     res.json({ success: true, conversation: updated });
 };
 
-const deleteConversation = (req, res) => {
-    const removed = memory.deleteConversation(req.params.id);
+const deleteConversation = async (req, res) => {
+    const removed = await memory.deleteConversation(req.ownerId, req.params.id);
 
     if (!removed) {
         return res.status(404).json({
@@ -241,14 +284,14 @@ const deleteConversation = (req, res) => {
     res.json({ success: true });
 };
 
-const getMemory = (req, res) => {
+const getMemory = async (req, res) => {
     res.json({
         success: true,
-        facts: memory.getFacts()
+        facts: await memory.getFacts(req.ownerId)
     });
 };
 
-const addMemoryItem = (req, res) => {
+const addMemoryItem = async (req, res) => {
     const text = String(req.body.text || "").trim().slice(0, 200);
 
     if (!text) {
@@ -260,21 +303,21 @@ const addMemoryItem = (req, res) => {
 
     res.json({
         success: true,
-        facts: memory.addFacts([text])
+        facts: await memory.addFacts(req.ownerId, [text])
     });
 };
 
-const deleteMemoryItem = (req, res) => {
-    memory.deleteFact(req.params.id);
+const deleteMemoryItem = async (req, res) => {
+    await memory.deleteFact(req.ownerId, req.params.id);
     res.json({ success: true });
 };
 
-const clearMemory = (req, res) => {
-    memory.clearFacts();
+const clearMemory = async (req, res) => {
+    await memory.clearFacts(req.ownerId);
     res.json({ success: true });
 };
 
-const sendFeedback = (req, res) => {
+const sendFeedback = async (req, res) => {
     const { conversationId, messageId, rating } = req.body;
 
     if (!conversationId || !messageId || ![null, "up", "down"].includes(rating)) {
@@ -284,7 +327,12 @@ const sendFeedback = (req, res) => {
         });
     }
 
-    const updated = memory.setFeedback(conversationId, messageId, rating);
+    const updated = await memory.setFeedback(
+        req.ownerId,
+        conversationId,
+        messageId,
+        rating
+    );
 
     if (!updated) {
         return res.status(404).json({
@@ -298,14 +346,14 @@ const sendFeedback = (req, res) => {
 
 module.exports = {
     streamChat,
-    listConversations,
-    createConversation,
-    getConversation,
-    renameConversation,
-    deleteConversation,
-    getMemory,
-    addMemoryItem,
-    deleteMemoryItem,
-    clearMemory,
-    sendFeedback
+    listConversations: safe(listConversations),
+    createConversation: safe(createConversation),
+    getConversation: safe(getConversation),
+    renameConversation: safe(renameConversation),
+    deleteConversation: safe(deleteConversation),
+    getMemory: safe(getMemory),
+    addMemoryItem: safe(addMemoryItem),
+    deleteMemoryItem: safe(deleteMemoryItem),
+    clearMemory: safe(clearMemory),
+    sendFeedback: safe(sendFeedback)
 };
