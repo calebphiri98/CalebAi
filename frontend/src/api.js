@@ -1,11 +1,52 @@
 export const API = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
-const JSON_HEADERS = { "Content-Type": "application/json" };
+const CLIENT_KEY = "caleb-ai-client-id";
+
+let fallbackClientId = null;
+
+const createClientId = () => {
+  if (window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+};
+
+const getClientId = () => {
+  try {
+    let id = localStorage.getItem(CLIENT_KEY);
+
+    if (!id) {
+      id = createClientId();
+      localStorage.setItem(CLIENT_KEY, id);
+    }
+
+    return id;
+  } catch (error) {
+    console.error("Client id error:", error);
+
+    if (!fallbackClientId) {
+      fallbackClientId = createClientId();
+    }
+
+    return fallbackClientId;
+  }
+};
+
+const buildHeaders = (extra = {}) => ({
+  "Content-Type": "application/json",
+  "X-Client-Id": getClientId(),
+  ...extra,
+});
 
 export const request = async (path, options = {}) => {
+  const { headers, ...rest } = options;
+
   const response = await fetch(`${API}${path}`, {
-    headers: JSON_HEADERS,
-    ...options,
+    ...rest,
+    headers: buildHeaders(headers),
   });
 
   const data = await response.json();
@@ -20,7 +61,7 @@ export const request = async (path, options = {}) => {
 export const streamChat = async ({ body, signal, onEvent }) => {
   const response = await fetch(`${API}/chat/stream`, {
     method: "POST",
-    headers: JSON_HEADERS,
+    headers: buildHeaders(),
     body: JSON.stringify(body),
     signal,
   });
