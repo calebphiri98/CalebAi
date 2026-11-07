@@ -865,3 +865,249 @@ button {
     padding: 8px;
   }
 }
+
+.attachments {
+  max-width: 820px;
+  margin: 0 auto 10px;
+  padding: 0 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.attachment {
+  position: relative;
+  width: 68px;
+  height: 68px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--soft);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  animation: attachment-in 0.18s ease-out;
+}
+
+.attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 13px;
+  display: block;
+}
+
+.attachment button {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.attachment button:hover {
+  transform: scale(1.12);
+}
+
+.attachment.processing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-style: dashed;
+  box-shadow: none;
+}
+
+.attachment-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--muted);
+  border-radius: 50%;
+  animation: attachment-spin 0.7s linear infinite;
+}
+
+@keyframes attachment-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes attachment-in {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.icon-button.attach {
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.icon-button.attach:hover:not(:disabled) {
+  background: var(--soft);
+  color: var(--text);
+}
+
+.icon-button.attach:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
+
+.icon-button.attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.message-images img {
+  max-width: 220px;
+  max-height: 180px;
+  border-radius: 12px;
+  object-fit: cover;
+  display: block;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+@media (max-width: 768px) {
+  .attachment {
+    width: 60px;
+    height: 60px;
+  }
+
+  .message-images img {
+    max-width: 150px;
+    max-height: 130px;
+  }
+}
+
+.document-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 240px;
+  padding: 8px 14px 8px 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--soft);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  animation: attachment-in 0.18s ease-out;
+}
+
+.attachments .document-chip {
+  min-height: 68px;
+  box-sizing: border-box;
+}
+
+.document-badge {
+  flex-shrink: 0;
+  width: 40px;
+  height: 48px;
+  border-radius: 9px;
+  background: #6b7280;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.document-chip.pdf .document-badge {
+  background: #dc2626;
+}
+
+.document-chip.docx .document-badge {
+  background: #2563eb;
+}
+
+.document-chip.pptx .document-badge {
+  background: #ea580c;
+}
+
+.document-chip.xlsx .document-badge {
+  background: #16a34a;
+}
+
+.document-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.document-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.document-size {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.document-remove {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.document-remove:hover {
+  transform: scale(1.12);
+}
+
+.message-documents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.composer.dragging .composer-box {
+  border-style: dashed;
+  border-color: var(--text);
+  background: var(--soft);
+}
+
+@media (max-width: 768px) {
+  .document-chip {
+    max-width: 100%;
+  }
+}
